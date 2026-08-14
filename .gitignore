@@ -1,0 +1,9 @@
+/target
+*.bak
+.env
+vault.json
+*.v1.bak
+
+# Agent build scaffolding (not part of the public tool)
+.claude/
+CONTRACT.md

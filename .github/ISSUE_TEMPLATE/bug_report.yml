@@ -1,0 +1,76 @@
+name: Bug report
+description: Report a problem with hearth-vault
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste a real secret, a `vault.json` file, or a recovery
+        mnemonic into this issue.** Sanitize command output before
+        pasting it — replace real key names, tokens, and file contents
+        with placeholders. Issues are public.
+
+        If you believe a secret may already have been exposed (by this
+        tool or otherwise), rotate it immediately; opening an issue does
+        not undo that.
+
+        For an actual vulnerability report (not a usage bug), use the
+        private security advisory process described in `SECURITY.md`
+        instead of filing a public issue.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened
+      description: What did you run, what did you expect, what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: >
+        Commands run, in order. Replace any real key names, values, file
+        paths containing secrets, or vault contents with placeholders
+        (e.g. `myapp/api_key` instead of your real key name if the name
+        itself is sensitive).
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: hearth-vault version
+      description: Output of `hearth-vault --version`
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: backend
+    attributes:
+      label: Backend (from `hearth-vault status`)
+      placeholder: e.g. tpm2, os-keyring, software
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: >
+        Paste sanitized command output or error messages. Double-check
+        there is no secret value, vault file content, or mnemonic in
+        what you paste.
+      render: shell

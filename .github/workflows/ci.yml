@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      # Deliberately NOT --all-features: the opt-in `tpm2` feature only
+      # builds on Linux x86_64/arm (tss-esapi-sys's build.rs panics on any
+      # other (arch, os) tuple, including Windows and Apple-silicon macOS —
+      # `--all-features` here would fail to even compile on two of the
+      # three matrix legs before a single test ran). Default features
+      # (os-keyring) is exactly the surface every platform must support;
+      # tpm2 gets its own dedicated Linux-only job below.
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # `--all-targets` picks up tests/cli.rs (the end-to-end CLI suite)
+      # alongside the unit tests already in src/. This is the step that
+      # actually exercises the Windows DACL code and (via os_keyring's
+      # #[ignore]d test, re-enabled below on macOS) the Keychain path —
+      # previously this workflow proved only that those code paths
+      # *compiled*, never that they *ran*.
+      - name: cargo test
+        run: cargo test --all-targets
+
+      # The OS-keyring roundtrip test is #[ignore]d by default because a
+      # fresh macOS runner's default keychain is locked with no GUI to
+      # unlock it, and Linux/Windows keyring backends need no such dance.
+      # On macOS specifically, spin up and unlock a disposable keychain so
+      # this genuinely runs instead of silently reading as "passing"
+      # coverage it never exercised.
+      - name: Create + unlock temporary keychain (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/hearth-vault-ci.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -base64 32)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 900 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_PATH"
+          # Make it the default AND put it first in the search list — the
+          # `keyring` crate (via the Security framework) resolves generic
+          # passwords against the default keychain, but a locked/absent
+          # default earlier in the search list can still shadow it.
+          EXISTING_KEYCHAINS="$(security list-keychains -d user | sed 's/"//g')"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $EXISTING_KEYCHAINS
+          security default-keychain -s "$KEYCHAIN_PATH"
+          echo "HEARTH_VAULT_CI_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: cargo test -- --ignored (OS keyring roundtrip, macOS only)
+        if: runner.os == 'macOS'
+        run: cargo test --lib -- --ignored --exact hsm::os_keyring::tests::test_os_keyring_roundtrip
+
+      - name: Remove temporary keychain (macOS only)
+        if: runner.os == 'macOS' && always()
+        run: |
+          if [ -n "${HEARTH_VAULT_CI_KEYCHAIN:-}" ]; then
+            security delete-keychain "$HEARTH_VAULT_CI_KEYCHAIN" || true
+          fi
+
+      # Independent confirmation of the DACL our own Win32 code sets,
+      # using a completely separate code path (`icacls`, not
+      # GetNamedSecurityInfoW) so a bug shared between `restrict_to_owner`
+      # and its own unit test can't hide from CI. `set` auto-creates the
+      # vault file with no `init` step needed (HEARTH_VAULT_PASSPHRASE
+      # supplied, so nothing prompts).
+      - name: Verify vault file ACL with icacls (Windows only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          HEARTH_VAULT_PASSPHRASE: ci-icacls-check-passphrase-not-a-real-secret
+        run: |
+          $vaultHome = Join-Path $env:RUNNER_TEMP "hv-icacls-check"
+          New-Item -ItemType Directory -Force -Path $vaultHome | Out-Null
+          $env:HEARTH_VAULT_HOME = $vaultHome
+
+          "icacls-probe-value" | cargo run --quiet -- set acl/icacls-probe --tier 3
+          if ($LASTEXITCODE -ne 0) { throw "hearth-vault set failed" }
+
+          $vaultFile = Join-Path $vaultHome "vault.json"
+          if (-not (Test-Path $vaultFile)) { throw "vault file was not created at $vaultFile" }
+
+          $aclOutput = icacls $vaultFile
+          Write-Output $aclOutput
+
+          $currentUser = "$env:USERDOMAIN\$env:USERNAME"
+          $userLine = $aclOutput | Select-String -SimpleMatch $env:USERNAME
+          if (-not $userLine) {
+            throw "icacls output does not list the current user ($currentUser) on ${vaultFile}: $aclOutput"
+          }
+
+          # No broader-than-owner identity should hold any grant on this file.
+          $broadGrantees = @('Everyone', 'BUILTIN\Users', 'Authenticated Users', 'NT AUTHORITY\Authenticated Users')
+          foreach ($name in $broadGrantees) {
+            if ($aclOutput -match [regex]::Escape($name)) {
+              throw "icacls shows a broader-than-owner grant ('$name') on ${vaultFile}: $aclOutput"
+            }
+          }
+
+  # Proves the opt-in tpm2 feature still compiles on its supported platform
+  # (Linux) without being part of the default build. Default builds must
+  # never require libtss2-esys — see Cargo.toml [features].
+  tpm2-build:
+    name: build (linux, --features tpm2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libtss2-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtss2-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --features tpm2
+        run: cargo build --features tpm2
+
+  # Proves the software-only path (no OS keyring, no TPM2) still compiles —
+  # this is the floor every platform must support.
+  no-default-features-build:
+    name: build (--no-default-features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --no-default-features
+        run: cargo build --no-default-features

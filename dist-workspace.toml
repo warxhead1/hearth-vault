@@ -1,0 +1,43 @@
+# cargo-dist (`dist`) workspace configuration.
+# https://opensource.axo.dev/cargo-dist/
+#
+# Regenerate with `dist init` after bumping the tool version rather than
+# hand-editing generated fields; this file is meant to be committed and
+# diffed, not treated as opaque.
+
+[workspace]
+members = ["cargo:."]
+
+[dist]
+# cargo-dist config version this file was written against.
+cargo-dist-version = "0.28.0"
+ci = ["github"]
+installers = ["shell", "powershell"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+install-path = "CARGO_HOME"
+# Default build must stay linkable everywhere the matrix above builds for —
+# do not add "tpm2" here. It links libtss2-esys (a C library) and is opt-in
+# on Linux only; see Cargo.toml [features] and the CI tpm2-build job.
+features = []
+
+# NOTE (follow-up, not yet solved by this config):
+#   - macOS artifacts (x86_64-apple-darwin, aarch64-apple-darwin) are built
+#     but not code-signed or notarized here. Gatekeeper will warn on first
+#     run until that is set up (an Apple Developer ID + notarization step
+#     added to the release CI job).
+#   - x86_64-unknown-linux-musl is built with default features, which
+#     currently includes `os-keyring`. The keyring crate's Linux backend
+#     (libsecret via D-Bus) is a dynamically-loaded system library, not a
+#     staticlib — it cannot be statically linked into a musl binary the way
+#     the rest of the dependency graph can. The musl artifact either needs
+#     `--no-default-features` (dropping OS-keyring support, software tier
+#     only) or a documented runtime dependency on libsecret being present.
+#     This has not been decided yet; flagging so it isn't silently shipped
+#     broken.
