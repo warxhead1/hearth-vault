@@ -43,6 +43,16 @@ jobs:
             os: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
+          # Same target, TPM2 compiled in. A SEPARATE artifact rather than a
+          # replacement: `tpm2` links libtss2-esys, so this binary needs that
+          # shared library present at runtime and will not start without it.
+          # The plain build above stays the portable one. Anyone sealing to a
+          # TPM downloads this instead of having to build it themselves.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            suffix: -tpm2
+            features: --features tpm2
+            packages: libtss2-dev
           # Full default features, keyring included: the Linux backend is
           # zbus (pure Rust D-Bus), so nothing here needs libsecret or
           # libdbus linked in. CI's musl job asserts the result really is
@@ -85,7 +95,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          NAME="hearth-vault-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          NAME="hearth-vault-${GITHUB_REF_NAME}-${{ matrix.target }}${{ matrix.suffix }}"
           mkdir -p "dist/$NAME"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/hearth-vault.exe" "dist/$NAME/"
@@ -110,7 +120,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: ${{ matrix.target }}${{ matrix.suffix }}
           path: |
             dist/*.tar.gz
             dist/*.zip
@@ -161,3 +171,14 @@ jobs:
             no system libraries. It still supports the OS-keyring tier, but
             that tier needs a Secret Service daemon running on the machine;
             without one, `hearth-vault` falls back to the software tier.
+
+            ## Which Linux build do I want?
+
+            Take the plain `x86_64-unknown-linux-gnu` unless you are sealing
+            to a TPM. The `-tpm2` build is the same binary with the TPM2
+            backend compiled in; it links `libtss2-esys`, so it needs
+            `libtss2-dev`'s runtime library installed and will not start
+            without it. TPM2 stays opt-in precisely because that is a
+            build-time C dependency — it is not available on macOS or
+            Windows at all, and requiring it by default would break
+            `cargo install` on most Linux machines.
