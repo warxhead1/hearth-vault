@@ -20,6 +20,13 @@ path = "src/lib.rs"
 name = "hearth-vault"
 path = "src/main.rs"
 
+# Diagnostic for "why is tier 2 not working on my machine" -- times each
+# keyring operation separately, which is how the locked-collection hang was
+# pinned down. Needs the backend it probes.
+[[example]]
+name = "keyring_probe"
+required-features = ["os-keyring"]
+
 [features]
 default = ["os-keyring"]
 # TPM2 links libtss2-esys (C). Opt-in: a bare `cargo install` must not need it.
@@ -50,13 +57,32 @@ thiserror = "2"
 tracing = "0.1"
 zeroize = { version = "1", features = ["derive", "zeroize_derive"] }
 
-keyring = { version = "3.6", optional = true }
 tss-esapi = { version = "7.6", optional = true }
+
+# keyring 3.x ships NO backend by default: every platform silently falls back
+# to an in-memory `mock` store unless you opt into the native one. A vault
+# that "sealed" tier-2 secrets into that mock would report success and store
+# nothing -- so the platform feature is mandatory here, per target.
+#
+# Linux uses async-secret-service (zbus, pure Rust) rather than
+# sync-secret-service (libdbus, a C library): it keeps `cargo install`
+# working with no system -dev packages and keeps the door open for static
+# builds. keyring blocks on it internally, so our call sites stay sync.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6", optional = true, features = [
+    "async-secret-service",
+    "crypto-rust",
+    "async-io",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", optional = true, features = ["apple-native"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6", optional = true, features = ["windows-native"] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",

@@ -235,14 +235,34 @@ force one with `--backend`:
 
 | OS      | Tier 1 (default when available)      | Tier 2 fallback |
 |---------|---------------------------------------|------------------|
-| Linux   | TPM2 (opt-in `tpm2` build feature) or libsecret via the OS keyring (`os-keyring` feature, on by default) | software vault (Argon2id + AES-256-GCM) |
+| Linux   | TPM2 (opt-in `tpm2` build feature) or the Secret Service via the OS keyring (`os-keyring` feature, on by default) | software vault (Argon2id + AES-256-GCM) |
 | macOS   | Keychain (`os-keyring`)               | software vault |
 | Windows | Credential Manager (`os-keyring`)     | software vault |
 
 The `tpm2` feature links `libtss2-esys`, a C library, so it is not compiled
 in by default — a plain `cargo install hearth-vault` never needs it. Enable
 it explicitly with `cargo install hearth-vault --features tpm2` on Linux
-where a TPM2 chip is present.
+where a TPM2 chip is present. The OS keyring needs no system packages: the
+Linux backend speaks D-Bus directly (zbus, pure Rust) rather than linking
+libsecret.
+
+### If the OS keyring hangs or gets skipped
+
+A **locked** keyring answers reads instantly but blocks writes while waiting
+on an unlock prompt — and in an SSH session, a CI job, or an agent tool call
+there is nobody to answer it. `hearth-vault` will not wait forever: keyring
+reads and writes are time-bounded (30s by default; set
+`HEARTH_VAULT_KEYRING_TIMEOUT_SECS` to change it) and you get an error naming
+the cause instead of a wedged terminal.
+
+To see exactly which step is at fault:
+
+```sh
+cargo run --example keyring_probe
+```
+
+Then unlock your keyring (Linux: your keyring UI or `secret-tool`; macOS:
+Keychain Access) and retry, or use a different tier.
 
 The vault file itself lives at the OS-standard application-data directory
 (`$XDG_DATA_HOME/hearth-vault/vault.json` on Linux, `~/Library/Application

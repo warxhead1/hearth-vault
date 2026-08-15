@@ -72,10 +72,17 @@ jobs:
           security default-keychain -s "$KEYCHAIN_PATH"
           echo "HEARTH_VAULT_CI_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
-      - name: cargo test -- --ignored (OS keyring roundtrip, macOS only)
-        if: runner.os == 'macOS'
+      # Windows needs no keychain dance -- the Credential Manager is usable
+      # straight from a CI session -- so the same roundtrip runs there too.
+      # This test is the ONLY thing that distinguishes a real backend from
+      # keyring's silent in-memory `mock` fallback (see Cargo.toml), so it
+      # must run somewhere on every push. Linux CI has no Secret Service
+      # daemon, so there it correctly self-skips via is_available().
+      - name: cargo test -- --ignored (OS keyring roundtrip, macOS + Windows)
+        if: runner.os == 'macOS' || runner.os == 'Windows'
         env:
           RUST_BACKTRACE: "1"
+          HEARTH_VAULT_REQUIRE_KEYRING: "1"
         run: cargo test --lib -- --ignored --exact hsm::os_keyring::tests::test_os_keyring_roundtrip
 
       # If the roundtrip fails, the useful question is "which keychain did
@@ -187,3 +194,42 @@ jobs:
 
       - name: cargo build --no-default-features
         run: cargo build --no-default-features
+
+  # musl is a release target with no other CI coverage, and it is the one
+  # most likely to break: it is statically linked, so any dependency that
+  # reaches for a C library fails here and nowhere else. Built WITH default
+  # features on purpose -- the Linux keyring backend is zbus (pure Rust, no
+  # libdbus/libsecret to link), so if that assumption is wrong this job is
+  # what says so, rather than a user discovering it in a release artifact.
+  musl-build:
+    name: build (x86_64-unknown-linux-musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --target x86_64-unknown-linux-musl
+        run: cargo build --locked --target x86_64-unknown-linux-musl
+
+      # Static means static: a musl artifact that turns out to be
+      # dynamically linked would fail on the minimal systems it exists for.
+      - name: Assert the binary is statically linked
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/debug/hearth-vault
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -qv 'not a dynamic executable'; then
+            echo "FAIL: musl build is dynamically linked:"; ldd "$BIN"; exit 1
+          fi
+          "$BIN" --version
