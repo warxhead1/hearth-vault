@@ -1,0 +1,136 @@
+# Hardware verification on a self-hosted runner.
+#
+# Everything in ci.yml runs on GitHub's hosted runners, which have no TPM chip
+# and no logged-in desktop session. Two claims therefore cannot be proven
+# there, only simulated:
+#
+#   - tier 1 sealing against a REAL TPM (ci.yml uses the swtpm simulator)
+#   - tier 2 against a REAL, interactively-unlocked desktop keyring
+#     (ci.yml uses a headless gnome-keyring started for the job)
+#
+# This workflow closes both, on a machine you own. It is optional: the project
+# is fully green without it, and this job simply does not run for anyone who
+# has not registered a runner.
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE ATTACHING A SELF-HOSTED RUNNER TO A PUBLIC REPO
+# ---------------------------------------------------------------------------
+# GitHub's own guidance is not to use self-hosted runners with public
+# repositories: anyone can open a pull request, and a workflow that runs on
+# fork PRs would execute that stranger's code on your machine, as your user.
+#
+# The mitigation here is structural, not procedural:
+#
+#   - `workflow_dispatch` ONLY. There is no `pull_request` trigger and no
+#     `push` trigger, so this cannot be started by anything a contributor
+#     submits. A maintainer has to click Run, having read the diff.
+#   - The runner should be registered with the `tpm2` label and used by
+#     nothing else, so a workflow elsewhere cannot land on it by accident.
+#   - Run it in a VM or a container with TPM passthrough if the machine has
+#     anything on it you care about. `cargo test` executes build scripts and
+#     proc macros from the dependency graph; that is arbitrary code by
+#     definition, even from a commit you trust.
+#
+# Registering a runner (once, on the machine with the TPM):
+#   Settings -> Actions -> Runners -> New self-hosted runner
+#   ./config.sh --url https://github.com/<you>/hearth-vault \
+#               --token <token> --labels self-hosted,linux,tpm2
+#   ./run.sh          # or install it as a service
+#
+# The runner's user needs TPM access (`sudo usermod -aG tss <user>`) and, for
+# the tier-2 leg, a real logged-in session whose keyring is unlocked.
+
+name: Hardware verify (self-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      keyring:
+        description: "Also verify tier 2 against the machine's real, unlocked keyring"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  hardware:
+    name: tier 1 on real TPM hardware
+    runs-on: [self-hosted, linux, tpm2]
+    steps:
+      - uses: actions/checkout@v5
+
+      # A self-hosted runner's workspace persists between runs, unlike a
+      # hosted one. Stale artifacts are exactly how a "passing" verification
+      # ends up having tested last month's binary.
+      - name: Show environment
+        run: |
+          echo "runner: $(hostname)"
+          rustc --version && cargo --version
+          ls -l /dev/tpmrm0 || echo "NO /dev/tpmrm0 — this runner has no TPM"
+          id
+
+      - name: Fail early if the TPM is not reachable
+        run: |
+          if [ ! -e /dev/tpmrm0 ]; then
+            echo "This job exists to test real TPM hardware and there is none."
+            exit 1
+          fi
+          if [ ! -r /dev/tpmrm0 ]; then
+            echo "/dev/tpmrm0 exists but is not readable by $(id -un)."
+            echo "Add the runner user to the 'tss' group and restart it."
+            exit 1
+          fi
+
+      - name: cargo build --features tpm2
+        run: cargo build --locked --features tpm2
+
+      # HEARTH_VAULT_TCTI is deliberately NOT set: the default is
+      # device:/dev/tpmrm0, which is the whole point of this job. REQUIRE_TPM2
+      # makes a missing TPM a failure instead of a skip, so this cannot pass
+      # having done nothing.
+      - name: TPM2 seal/unseal against the real chip
+        env:
+          RUST_BACKTRACE: "1"
+          HEARTH_VAULT_REQUIRE_TPM2: "1"
+        run: |
+          cargo test --locked --features tpm2 --lib -- --ignored --test-threads=1 \
+            --exact hsm::tpm2::tests::test_tpm2_seal_unseal_roundtrip
+
+      # PCR0 binding is the security property that matters, and no job can
+      # prove it: showing "unseal fails once PCR0 differs" needs a firmware
+      # change and a reboot mid-run. Record PCR0 instead, so a maintainer
+      # comparing two runs across a BIOS update can see the value move -- and
+      # can then confirm by hand that the old blob no longer unseals.
+      - name: Record PCR0 (for cross-run comparison)
+        run: tpm2_pcrread sha256:0 || echo "tpm2-tools not installed; skipping"
+
+      - name: Full test suite on this machine
+        run: cargo test --locked --all-targets
+
+  keyring:
+    name: tier 2 against a real unlocked keyring
+    if: inputs.keyring
+    runs-on: [self-hosted, linux, tpm2]
+    steps:
+      - uses: actions/checkout@v5
+
+      # This leg needs the runner to be running INSIDE the desktop session
+      # whose keyring you want tested (DBUS_SESSION_BUS_ADDRESS inherited from
+      # a real login). A runner started by systemd --system has no session bus
+      # and will correctly report the keyring as unavailable.
+      - name: Verify there is a session bus
+        run: |
+          if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+            echo "No DBUS_SESSION_BUS_ADDRESS: this runner is not inside a desktop session,"
+            echo "so it cannot test the real keyring. Start the runner from your session."
+            exit 1
+          fi
+
+      - name: Keyring roundtrip
+        env:
+          RUST_BACKTRACE: "1"
+          HEARTH_VAULT_REQUIRE_KEYRING: "1"
+        run: |
+          cargo test --locked --lib -- --ignored \
+            --exact hsm::os_keyring::tests::test_os_keyring_roundtrip

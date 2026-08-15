@@ -36,10 +36,27 @@ use crate::hsm::{HsmError, SecretBackend};
 const SEALED_BLOB_PATH: &str = ".config/hearth/tpm-sealed.bin";
 const TPM_DEVICE: &str = "/dev/tpmrm0";
 
-/// Open a TPM2 context connected to `/dev/tpmrm0`.
+/// The TCTI (transmission interface) string used to reach the TPM.
+///
+/// Defaults to the in-kernel resource manager, `device:/dev/tpmrm0`. Override
+/// with `HEARTH_VAULT_TCTI` to point at something else -- notably
+/// `swtpm:host=127.0.0.1,port=2321`, which is how tier 1 gets exercised for
+/// real in CI, since no hosted runner has a TPM chip. Anything the tss2 loader
+/// accepts works: `device:/dev/tpm0`, `mssim:...`, `tabrmd:...`.
+///
+/// This is a diagnostic/test escape hatch, not a security boundary: an attacker
+/// who can set your environment can already do far worse than redirect a TCTI.
+fn tcti_conf() -> String {
+    match std::env::var("HEARTH_VAULT_TCTI") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => format!("device:{}", TPM_DEVICE),
+    }
+}
+
+/// Open a TPM2 context (see [`tcti_conf`] for which TPM).
 fn open_context() -> tss_esapi::Result<Context> {
     use std::str::FromStr;
-    let tcti = TctiNameConf::from_str(&format!("device:{}", TPM_DEVICE))
+    let tcti = TctiNameConf::from_str(&tcti_conf())
         .map_err(|_| tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::InvalidParam))?;
     Context::new(tcti)
 }
@@ -223,9 +240,14 @@ impl Tpm2Backend {
         Tpm2Backend
     }
 
-    /// Returns `true` if `/dev/tpmrm0` is present and a TPM context can be opened.
+    /// Returns `true` if a TPM context can actually be opened.
+    ///
+    /// The device-file check is only a fast path for the default TCTI: a
+    /// non-default `HEARTH_VAULT_TCTI` (a simulator on a socket, say) has no
+    /// `/dev/tpmrm0` to look at, so in that case the open attempt IS the check.
     pub fn is_available() -> bool {
-        if !std::path::Path::new(TPM_DEVICE).exists() {
+        let default_tcti = std::env::var_os("HEARTH_VAULT_TCTI").is_none();
+        if default_tcti && !std::path::Path::new(TPM_DEVICE).exists() {
             return false;
         }
         // Try to open the context; if it fails (e.g. permission denied) we're unavailable.
@@ -384,10 +406,25 @@ mod tests {
 
     /// Full seal/unseal round-trip.
     ///
-    /// Requires `/dev/tpmrm0` access (user must be in `tss` group).
+    /// Needs a reachable TPM: either `/dev/tpmrm0` (user in the `tss` group) or
+    /// a simulator via `HEARTH_VAULT_TCTI` — CI uses swtpm, since no hosted
+    /// runner has a TPM chip. Set `HEARTH_VAULT_REQUIRE_TPM2=1` to turn "no TPM
+    /// here" from a skip into a failure, so a CI job that was supposed to
+    /// exercise tier 1 cannot quietly pass having exercised nothing.
     #[test]
-    #[ignore = "requires TPM hardware — run with: cargo test --features tpm2 -- --include-ignored --test-threads=1"]
+    #[ignore = "requires a TPM or simulator — run with: cargo test --features tpm2 -- --include-ignored --test-threads=1"]
     fn test_tpm2_seal_unseal_roundtrip() {
+        if !Tpm2Backend::is_available() {
+            assert!(
+                std::env::var_os("HEARTH_VAULT_REQUIRE_TPM2").is_none(),
+                "HEARTH_VAULT_REQUIRE_TPM2 is set but no TPM is reachable at {} — \
+                 tier 1 was NOT exercised",
+                tcti_conf(),
+            );
+            println!("no TPM reachable at {} — skipping", tcti_conf());
+            return;
+        }
+
         // Use a temp path so we don't clobber a real deployment blob.
         let dir = tempfile::tempdir().expect("tempdir");
         // Override HOME so blob_path() points inside the temp dir.

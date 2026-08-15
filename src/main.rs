@@ -46,10 +46,15 @@ enum Commands {
         /// Key name(s) (e.g., "myapp/api_key", "myapp/db_password")
         keys: Vec<String>,
         /// Security tier: 1/2 = exportable (printable to stdout or a file),
-        /// 3 = use-only, never printed but usable via `exec` (default),
-        /// 4 = sign-only, never printed and never injected — `sign` only
-        #[arg(short, long, default_value_t = TIER_USE_ONLY)]
-        tier: u8,
+        /// 3 = use-only, never printed but usable via `exec` (default for a
+        /// NEW key), 4 = sign-only, never printed and never injected —
+        /// `sign` only.
+        ///
+        /// Omit it when rotating: overwriting an existing key keeps that
+        /// key's current tier, so putting a fresh value behind an existing
+        /// name cannot silently change who is allowed to read it.
+        #[arg(short, long)]
+        tier: Option<u8>,
     },
     /// Import a single credential from a file (for browser-automation
     /// handoff, or piping a generated key straight in).
@@ -176,10 +181,13 @@ enum Commands {
     /// straight into a child process's environment, never a stream the
     /// caller (human or agent) reads.
     ///
-    /// Every tier-<3 key under `--prefix` is resolved to an env var (same
-    /// name mapping as export-env-file: strip prefix, uppercase, `/` and
-    /// `-` → `_`) and added to the child's environment; then the command is
-    /// exec'd. Tier-3 (use-only) keys are skipped — use `sign` for those.
+    /// Every key under `--prefix` below tier 4 is resolved to an env var
+    /// (same name mapping as export-env-file: strip prefix, uppercase, `/`
+    /// and `-` → `_`) and added to the child's environment; then the command
+    /// is exec'd. Tier 3 (use-only, the default for new secrets) IS injected
+    /// here — that is the entire point of this command, and the reason a
+    /// tier-3 key can be used without ever being printed. Only tier-4
+    /// (sign-only) keys are skipped; use `sign` for those.
     ///
     /// Example:
     ///   hearth-vault exec --prefix myapp/ -- ./start-server --port 8080
@@ -208,6 +216,11 @@ enum Commands {
     ///
     /// Example: hearth-vault github-app-token --installation-id 123456789
     /// Example (scoped): hearth-vault github-app-token --installation-id 123456789 --repository myapp --repository myapp-infra
+    ///
+    /// This is the one subcommand that talks to the network, so it is the one
+    /// subcommand behind a feature flag. Built without `github-app-token`,
+    /// there is no HTTP client in the binary at all.
+    #[cfg(feature = "github-app-token")]
     GithubAppToken {
         /// GitHub App installation ID. If omitted, falls back to the
         /// `auth/GITHUB_APP_INSTALLATION_ID` vault entry.
@@ -572,6 +585,7 @@ fn main() -> anyhow::Result<()> {
             algorithm,
             message,
         } => cmd_sign(vault_path, backend, &key, &algorithm, &message)?,
+        #[cfg(feature = "github-app-token")]
         Commands::GithubAppToken {
             installation_id,
             json,
@@ -660,7 +674,7 @@ fn cmd_set(
     vault_path: PathBuf,
     backend: Option<&str>,
     keys: &[String],
-    tier: u8,
+    tier: Option<u8>,
 ) -> anyhow::Result<()> {
     if keys.is_empty() {
         anyhow::bail!("provide at least one key name");
@@ -670,6 +684,7 @@ fn cmd_set(
     let mut store = open_vault(vault_path, backend)?;
 
     let interactive = std::io::stdin().is_terminal();
+    let mut stored_tiers: Vec<u8> = Vec::with_capacity(keys.len());
 
     for key in keys {
         let mut value = if interactive {
@@ -689,15 +704,23 @@ fn cmd_set(
             continue;
         }
 
+        // Rotation must not retier. An explicit --tier always wins; with no
+        // flag, an existing key keeps the tier it already has and only a new
+        // key gets the tier-3 default. Otherwise `set` on a tier-2 key --
+        // the ordinary way to rotate a value -- would quietly promote it to
+        // use-only and break whatever was reading it via export-env.
+        let key_tier = tier.or_else(|| store.tier_of(key)).unwrap_or(TIER_USE_ONLY);
+
         let sensitive = SensitiveString::new(value.clone());
         value.zeroize();
-        store.set(key, &sensitive, tier)?;
-        eprintln!("  \u{2713} {key}");
+        store.set(key, &sensitive, key_tier)?;
+        eprintln!("  \u{2713} {key} (tier {key_tier})");
+        stored_tiers.push(key_tier);
     }
 
     store.save()?;
-    eprintln!("Stored {} credential(s) at tier {tier}.", keys.len());
-    if tier == TIER_USE_ONLY {
+    eprintln!("Stored {} credential(s).", keys.len());
+    if stored_tiers.contains(&TIER_USE_ONLY) {
         eprintln!(
             "Tier {TIER_USE_ONLY} is use-only: never printed by export-env / export-env-file. \
              Use them with `hearth-vault exec --prefix <prefix> -- <command>`, or run \
@@ -1484,6 +1507,7 @@ fn cmd_sign(
 ///
 /// Names are simple repo names (`myapp`), not `owner/repo` slugs — GitHub
 /// scopes by name within the installation's owner.
+#[cfg(feature = "github-app-token")]
 fn build_token_request_body(repos: &[String]) -> anyhow::Result<Option<serde_json::Value>> {
     if repos.is_empty() {
         return Ok(None);
@@ -1498,6 +1522,7 @@ fn build_token_request_body(repos: &[String]) -> anyhow::Result<Option<serde_jso
     Ok(Some(serde_json::json!({ "repositories": repos })))
 }
 
+#[cfg(feature = "github-app-token")]
 fn cmd_github_app_token(
     vault_path: PathBuf,
     backend: Option<&str>,
@@ -2358,6 +2383,7 @@ mod tests {
     /// Zero repos must yield no JSON body — preserves the pre-flag behavior
     /// where the POST goes out empty and GitHub returns a full-installation
     /// token. This is the backward-compat guarantee for existing callers.
+    #[cfg(feature = "github-app-token")]
     #[test]
     fn build_token_request_body_zero_repos_is_none() {
         let body = build_token_request_body(&[]).unwrap();
@@ -2369,6 +2395,7 @@ mod tests {
 
     /// Single repo → `{"repositories": ["myapp"]}`. The minted token will
     /// only have access to that one repo, not every repo on the installation.
+    #[cfg(feature = "github-app-token")]
     #[test]
     fn build_token_request_body_single_repo() {
         let body = build_token_request_body(&["myapp".to_string()])
@@ -2378,6 +2405,7 @@ mod tests {
     }
 
     /// Multiple repos preserve order and produce a single repositories array.
+    #[cfg(feature = "github-app-token")]
     #[test]
     fn build_token_request_body_multiple_repos() {
         let body = build_token_request_body(&["myapp".to_string(), "myapp-infra".to_string()])
@@ -2392,6 +2420,7 @@ mod tests {
     /// An empty-string repo must hard-error BEFORE the API call. GitHub
     /// silently degrades `{"repositories": [""]}` to "full installation
     /// scope", which would defeat the entire point of this flag.
+    #[cfg(feature = "github-app-token")]
     #[test]
     fn build_token_request_body_rejects_empty_string() {
         let err = build_token_request_body(&["".to_string()]).unwrap_err();
@@ -2404,6 +2433,7 @@ mod tests {
     /// Whitespace-only is functionally equivalent to empty for GitHub's
     /// purposes; reject the same way so neither `--repository ""` nor
     /// `--repository "   "` slips through to widen scope.
+    #[cfg(feature = "github-app-token")]
     #[test]
     fn build_token_request_body_rejects_whitespace_only() {
         assert!(build_token_request_body(&["   ".to_string()]).is_err());
@@ -2411,6 +2441,7 @@ mod tests {
 
     /// Mixed-validity input rejects rather than silently dropping the bad
     /// entry — fail loud rather than mint a token with surprising scope.
+    #[cfg(feature = "github-app-token")]
     #[test]
     fn build_token_request_body_rejects_when_any_entry_is_empty() {
         let err = build_token_request_body(&[

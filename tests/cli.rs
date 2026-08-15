@@ -179,6 +179,60 @@ fn set_default_tier_is_three_and_visible_in_list() {
     );
 }
 
+/// Rotating a value must not change who can read it. `set` on an existing
+/// key with no `--tier` keeps that key's tier; the tier-3 default applies to
+/// NEW keys only. Before this was fixed, rotating a tier-2 credential quietly
+/// promoted it to use-only and broke whatever consumed it via export-env.
+#[test]
+fn set_preserves_the_tier_of_an_existing_key() {
+    let fx = VaultFixture::new();
+
+    fx.cmd()
+        .args(["set", "myapp/rotating-key", "--tier", "2"])
+        .write_stdin("first-value\n")
+        .assert()
+        .success();
+
+    // Rotate: same key, new value, no --tier.
+    fx.cmd()
+        .args(["set", "myapp/rotating-key"])
+        .write_stdin("second-value\n")
+        .assert()
+        .success();
+
+    let assert = fx.cmd().arg("list").assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let row = stdout
+        .lines()
+        .find(|l| l.contains("myapp/rotating-key"))
+        .unwrap_or_else(|| panic!("no row for rotating-key in list output:\n{stdout}"));
+    let cols: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(
+        cols.get(1).copied(),
+        Some("2"),
+        "rotation must keep tier 2, row was: {row}"
+    );
+
+    // An explicit --tier still wins.
+    fx.cmd()
+        .args(["set", "myapp/rotating-key", "--tier", "3"])
+        .write_stdin("third-value\n")
+        .assert()
+        .success();
+
+    let assert = fx.cmd().arg("list").assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let row = stdout
+        .lines()
+        .find(|l| l.contains("myapp/rotating-key"))
+        .unwrap_or_else(|| panic!("no row for rotating-key:\n{stdout}"));
+    assert_eq!(
+        row.split_whitespace().nth(1),
+        Some("3"),
+        "explicit --tier must override the preserved tier, row was: {row}"
+    );
+}
+
 // ── tier-3 exec injection + env-name mapping ────────────────────────────
 
 /// `exec --prefix myapp/ -- <cmd>` puts tier-3 (default) values into the

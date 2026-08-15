@@ -21,7 +21,7 @@ If you already have a `.env` file, this is the fastest path from there to a
 vault-backed project:
 
 ```
-cargo install hearth-vault
+cargo install --locked --git https://github.com/warxhead1/hearth-vault
 hearth-vault init
 hearth-vault import-env .env --prefix myapp/
 hearth-vault exec --prefix myapp/ -- npm run dev
@@ -240,9 +240,9 @@ force one with `--backend`:
 | Windows | Credential Manager (`os-keyring`)     | software vault |
 
 The `tpm2` feature links `libtss2-esys`, a C library, so it is not compiled
-in by default — a plain `cargo install hearth-vault` never needs it. Enable
-it explicitly with `cargo install hearth-vault --features tpm2` on Linux
-where a TPM2 chip is present. The OS keyring needs no system packages: the
+in by default — a plain install never needs it. Enable it explicitly by
+appending `--features tpm2` to the install command above, on Linux where a
+TPM2 chip is present. The OS keyring needs no system packages: the
 Linux backend speaks D-Bus directly (zbus, pure Rust) rather than linking
 libsecret.
 
@@ -279,6 +279,31 @@ between two entries. The blob is decrypted with a random 256-bit data key,
 which is itself independently wrapped by two things: your passphrase
 (Argon2id) and, if you generate one, a 24-word BIP39 recovery mnemonic. See
 `SECURITY.md` for the full cryptographic detail.
+
+## Using it with coding agents
+
+The point of the tool is that an agent can *use* your credentials without
+*seeing* them, and that only works if the agent knows which commands are safe.
+Three drop-in files do that, and none of them require the agent to be clever:
+
+- **[`AGENTS.md`](AGENTS.md)** — the convention Codex, Cursor, Aider and
+  others read automatically. Copy it into your own project's root (or append
+  it to the one you already have).
+- **[`skills/hearth-vault/SKILL.md`](skills/hearth-vault/SKILL.md)** — a
+  Claude Code skill. Install it per-project or for every project:
+
+  ```sh
+  mkdir -p ~/.claude/skills/hearth-vault
+  cp skills/hearth-vault/SKILL.md ~/.claude/skills/hearth-vault/
+  ```
+
+- **[`USAGE.md`](USAGE.md)** — recipes for humans: replacing a `.env` file,
+  shell-rc wiring that does not export secrets into every process, CI,
+  rotation, docker compose.
+
+The short version of all three: agents run `hearth-vault exec -- <command>`
+and `hearth-vault sign`; they never run `export-env`, never `cat` a `.env`,
+and never put a value in a variable they might later echo.
 
 ## Limitations
 

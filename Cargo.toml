@@ -28,10 +28,18 @@ name = "keyring_probe"
 required-features = ["os-keyring"]
 
 [features]
-default = ["os-keyring"]
+default = ["os-keyring", "github-app-token"]
 # TPM2 links libtss2-esys (C). Opt-in: a bare `cargo install` must not need it.
 tpm2 = ["dep:tss-esapi"]
 os-keyring = ["dep:keyring"]
+# The ONLY code in this crate that opens a network socket is minting a GitHub
+# App installation token (POST api.github.com, and only when you run that one
+# subcommand). It is a feature so that "this binary cannot phone home" is
+# something you can VERIFY rather than something we assert: build with
+# `--no-default-features --features os-keyring` and no HTTP client is compiled
+# into the binary at all. CI's no-network-build job proves reqwest is absent
+# from that dependency graph on every push.
+github-app-token = ["dep:reqwest"]
 
 [dependencies]
 aes-gcm = "0.10"
@@ -47,7 +55,11 @@ hkdf = "0.12"
 pem-rfc7468 = { version = "0.7", features = ["alloc"] }
 rand = "0.8"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }
 ring = "0.17"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }

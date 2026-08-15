@@ -24,7 +24,10 @@ produces. You never receive the value itself.
 ```sh
 hearth-vault exec --prefix myapp/ -- npm run dev
 hearth-vault exec --prefix myapp/ -- python manage.py migrate
-hearth-vault exec --prefix myapp/ -- curl -H "Authorization: Bearer $API_KEY" https://api.example.com/status
+# Note the single quotes and the `sh -c`: the env var is expanded by the
+# CHILD, after injection. Double quotes would make your own shell expand
+# $API_KEY to an empty string before hearth-vault ever ran.
+hearth-vault exec --prefix myapp/ -- sh -c 'curl -H "Authorization: Bearer $API_KEY" https://api.example.com/status'
 ```
 
 The prefix maps to env var names by stripping the prefix, uppercasing, and

@@ -19,6 +19,20 @@ cargo clippy --all-targets -- -D warnings
 echo "==> cargo clippy --no-default-features"
 cargo clippy --all-targets --no-default-features -- -D warnings
 
+# The no-phone-home claim, checked the same way CI checks it: no HTTP client
+# in the network-free build, and exactly one outbound URL in the whole tree.
+echo "==> no-network build + egress assertions"
+cargo build --quiet --no-default-features --features os-keyring
+if cargo tree --no-default-features --features os-keyring -e normal \
+    | grep -qE '^[^a-z]*(reqwest|hyper|ureq|curl|isahc) v'; then
+    echo "FAIL: an HTTP client is present in the no-network build"; exit 1
+fi
+urls=$(grep -rnoE 'https?://[a-zA-Z0-9.-]+' src/ --include='*.rs' \
+       | grep -v 'src/scan.rs' | grep -vE '://(schemas|www|docs|github)\.' || true)
+if [ "$(grep -c . <<<"$urls")" != 1 ] || ! grep -q 'api.github.com' <<<"$urls"; then
+    echo "FAIL: expected exactly one outbound URL (api.github.com):"; echo "$urls"; exit 1
+fi
+
 echo "==> cargo test --all-targets"
 cargo test --all-targets
 

@@ -76,14 +76,41 @@ jobs:
       # straight from a CI session -- so the same roundtrip runs there too.
       # This test is the ONLY thing that distinguishes a real backend from
       # keyring's silent in-memory `mock` fallback (see Cargo.toml), so it
-      # must run somewhere on every push. Linux CI has no Secret Service
-      # daemon, so there it correctly self-skips via is_available().
+      # must run on every push, on every platform that has a store.
       - name: cargo test -- --ignored (OS keyring roundtrip, macOS + Windows)
         if: runner.os == 'macOS' || runner.os == 'Windows'
         env:
           RUST_BACKTRACE: "1"
           HEARTH_VAULT_REQUIRE_KEYRING: "1"
         run: cargo test --lib -- --ignored --exact hsm::os_keyring::tests::test_os_keyring_roundtrip
+
+      # Linux runners ship no Secret Service daemon, so this roundtrip used to
+      # self-skip here -- meaning the platform most users are on was the one
+      # platform where tier 2 never actually ran. Start a private session bus
+      # and a gnome-keyring daemon on it, unlock the default collection with a
+      # throwaway password fed on stdin (which is where --unlock reads it),
+      # and require the test to really execute.
+      #
+      # dbus-run-session gives this step its own bus, so nothing here can
+      # collide with, or leak into, anything else on the runner.
+      - name: Install gnome-keyring + dbus (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y gnome-keyring dbus-x11
+
+      - name: cargo test -- --ignored (Secret Service roundtrip, Linux)
+        if: runner.os == 'Linux'
+        env:
+          RUST_BACKTRACE: "1"
+          HEARTH_VAULT_REQUIRE_KEYRING: "1"
+        run: |
+          # Compile first: cargo's own build output would otherwise be buried
+          # inside the keyring session below, making a failure unreadable.
+          cargo test --lib --no-run
+          dbus-run-session -- bash -euo pipefail -c '
+            echo -n "ci-throwaway-keyring-password" \
+              | gnome-keyring-daemon --unlock --components=secrets > /dev/null
+            cargo test --lib -- --ignored --exact hsm::os_keyring::tests::test_os_keyring_roundtrip
+          '
 
       # If the roundtrip fails, the useful question is "which keychain did
       # the write land in, and can the plain `security` CLI round-trip the
@@ -155,19 +182,31 @@ jobs:
             }
           }
 
-  # Proves the opt-in tpm2 feature still compiles on its supported platform
-  # (Linux) without being part of the default build. Default builds must
-  # never require libtss2-esys — see Cargo.toml [features].
-  tpm2-build:
-    name: build (linux, --features tpm2)
+  # Tier 1 (TPM2), exercised for real against a SOFTWARE TPM.
+  #
+  # No hosted runner has a TPM chip, so this used to be a compile-only job:
+  # it proved the opt-in feature still built and nothing more, leaving the
+  # highest-security tier as the one tier whose seal/unseal had never run
+  # anywhere but the author's desktop. swtpm closes that gap -- it is the
+  # same TPM 2.0 reference implementation the kernel's own test suites use,
+  # reached through the standard tss2 loader via HEARTH_VAULT_TCTI.
+  #
+  # A simulator is not a hardware attestation: it proves our sealing logic,
+  # PCR0 policy construction and blob format are correct, NOT that a real
+  # chip enforces them. Hardware is covered by selfhosted.yml.
+  tpm2:
+    name: tpm2 (swtpm simulator)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install libtss2-dev
+      - name: Install libtss2-dev + swtpm
         run: |
           sudo apt-get update
-          sudo apt-get install -y libtss2-dev
+          # libtss2-tcti-swtpm0 is the piece that makes HEARTH_VAULT_TCTI=swtpm:...
+          # resolvable by the tss2 loader; libtss2-dev alone does not pull it in.
+          sudo apt-get install -y \
+            libtss2-dev libtss2-tcti-swtpm0 swtpm swtpm-tools tpm2-tools
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -175,8 +214,96 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Default builds must NEVER require libtss2-esys -- that is the whole
+      # point of tpm2 being opt-in, so keep proving the feature compiles
+      # before spending time on the simulator.
       - name: cargo build --features tpm2
         run: cargo build --features tpm2
+
+      - name: Start swtpm
+        run: |
+          mkdir -p "$RUNNER_TEMP/swtpm"
+          swtpm socket \
+            --tpmstate "dir=$RUNNER_TEMP/swtpm" \
+            --ctrl "type=tcp,port=2322" \
+            --server "type=tcp,port=2321" \
+            --flags not-need-init,startup-clear \
+            --tpm2 \
+            --daemon
+          # Wait for the socket rather than sleeping a guessed interval.
+          for _ in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/2321) 2>/dev/null; then
+              echo "swtpm is listening"; exit 0
+            fi
+            sleep 0.2
+          done
+          echo "swtpm never came up"; exit 1
+
+      # PCR0 on a freshly started simulator is all-zeroes and never extended,
+      # which is fine: the test seals to whatever PCR0 currently reads and
+      # unseals against the same value. What it proves is that the policy
+      # session, the sealed-object template and the blob round-trip are
+      # correct -- the parts that were previously unexecuted code.
+      #
+      # HEARTH_VAULT_REQUIRE_TPM2 turns "no TPM here" from a skip into a
+      # failure, so this job cannot pass by silently doing nothing.
+      - name: cargo test -- --ignored (TPM2 seal/unseal roundtrip)
+        env:
+          RUST_BACKTRACE: "1"
+          HEARTH_VAULT_TCTI: swtpm:host=127.0.0.1,port=2321
+          HEARTH_VAULT_REQUIRE_TPM2: "1"
+        run: |
+          cargo test --features tpm2 --lib -- --ignored --test-threads=1 \
+            --exact hsm::tpm2::tests::test_tpm2_seal_unseal_roundtrip
+
+  # "It cannot phone home" is only worth saying if it is checked. Build the
+  # network-free configuration and prove no HTTP client is even present in
+  # the dependency graph -- not that we avoid calling one, that there is
+  # none to call. See Cargo.toml [features].github-app-token.
+  no-network-build:
+    name: build (no network client)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --no-default-features --features os-keyring
+        run: cargo build --no-default-features --features os-keyring
+
+      - name: Assert no HTTP client in the dependency graph
+        run: |
+          set -euo pipefail
+          TREE=$(cargo tree --no-default-features --features os-keyring -e normal)
+          for crate in reqwest hyper ureq curl isahc; do
+            if grep -qE "^[^a-z]*${crate} v" <<< "$TREE"; then
+              echo "FAIL: '$crate' is in the no-network dependency graph:"
+              grep -E "${crate} v" <<< "$TREE"
+              exit 1
+            fi
+          done
+          echo "no HTTP client present"
+
+      # Belt and braces: even the DEFAULT build must contain exactly one
+      # outbound URL, and it must be the GitHub App endpoint. A new call
+      # site added anywhere else fails here rather than shipping quietly.
+      - name: Assert the default build has exactly one outbound URL
+        run: |
+          set -euo pipefail
+          HITS=$(grep -rnoE 'https?://[a-zA-Z0-9.-]+' src/ --include='*.rs' \
+                 | grep -v 'src/scan.rs' \
+                 | grep -vE '://(schemas|www|docs|github)\.' || true)
+          echo "$HITS"
+          COUNT=$(grep -c 'api.github.com' <<< "$HITS" || true)
+          TOTAL=$(grep -c . <<< "$HITS" || true)
+          if [ "$TOTAL" != "$COUNT" ] || [ "$COUNT" != "1" ]; then
+            echo "FAIL: expected exactly one outbound URL (api.github.com), got $TOTAL"
+            exit 1
+          fi
 
   # Proves the software-only path (no OS keyring, no TPM2) still compiles —
   # this is the floor every platform must support.

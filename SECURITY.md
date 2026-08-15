@@ -80,6 +80,46 @@
   independently, so changing your passphrase rewraps the data key without
   touching or re-encrypting any stored entry.
 
+## Network behaviour — no telemetry, no phone home
+
+`hearth-vault` has **no analytics, no crash reporting, no update check, and no
+license or activation call**. It does not open a socket at startup, on `init`,
+on `set`, on `exec`, or on any other command you might run a hundred times a
+day.
+
+There is exactly **one** command in the whole tool that touches the network:
+`github-app-token`, which POSTs to `api.github.com` to exchange a signed JWT
+for a GitHub App installation token. That is the operation you asked for; it
+cannot happen unless you type it.
+
+You do not have to take that on faith. Three checks, in increasing strength:
+
+```sh
+# 1. Every outbound URL in the source. Expect exactly one hit.
+grep -rn 'https\?://' src/ --include='*.rs'
+
+# 2. The HTTP client is a build feature. Compile without it and there is no
+#    HTTP client in the binary at all -- nothing to call, whatever the code says.
+cargo build --no-default-features --features os-keyring
+cargo tree --no-default-features --features os-keyring -e normal | grep -i reqwest   # no output
+
+# 3. Watch it. Nothing should appear except when you run github-app-token.
+strace -f -e trace=network hearth-vault set demo/key      # Linux
+```
+
+CI runs checks 1 and 2 on every push (the `no-network-build` job), so a new
+call site added anywhere in the tree fails the build rather than shipping
+quietly.
+
+Two honest caveats:
+
+- The OS-keyring tier talks to your **local** credential store over D-Bus
+  (Linux) or a platform API (macOS/Windows). That is IPC on your own machine,
+  not network traffic, but it will show up in a syscall trace.
+- `exec` runs the command **you** name with secrets in its environment. If that
+  command phones home, it does so with your credential. `hearth-vault` cannot
+  police what a child process does; see the threat model above.
+
 ## Release artifacts — what is and isn't guaranteed
 
 Every tagged release is built by GitHub Actions from the tagged commit, on a
@@ -129,6 +169,32 @@ naming the cause.
 
 TPM2 (tier 1) is a separate opt-in build feature and is in no prebuilt
 artifact at all; it must be compiled in with `--features tpm2`.
+
+## What is verified, on what, and by whom
+
+Being explicit about this matters more than a green badge: a test that
+silently skips reads exactly like a test that passed.
+
+| Claim | Where it is proven | Strength |
+|---|---|---|
+| Builds + full test suite | Linux, macOS, Windows on every push | real |
+| Tier 2 on macOS Keychain | macOS CI, real Keychain | real |
+| Tier 2 on Windows Credential Manager | Windows CI | real |
+| Tier 2 on Linux Secret Service | Linux CI, gnome-keyring on a private D-Bus | real |
+| Tier 1 TPM2 seal/unseal | Linux CI, **swtpm simulator** | logic only |
+| Tier 1 on real TPM hardware | opt-in self-hosted runner (`selfhosted.yml`) | real, but only when a maintainer runs it |
+| PCR0 actually resists a firmware change | **nowhere** — needs a reboot into changed firmware | manual |
+| Vault file permissions (Unix mode) | Linux + macOS CI | real |
+| Vault file DACL (Windows) | Windows CI, verified independently with `icacls` | real |
+| No HTTP client without the feature | Linux CI dependency-graph assertion | real |
+| Static musl artifact is really static | Linux CI, `ldd` dependency check | real |
+
+The tier-2 tests are deliberately two-instance (seal with one backend handle,
+unseal with a second): a single-instance roundtrip passes against an in-memory
+mock, which is how a mock backend once masqueraded as a working keyring on
+every platform at once. `HEARTH_VAULT_REQUIRE_KEYRING=1` and
+`HEARTH_VAULT_REQUIRE_TPM2=1` turn "no backend here" from a skip into a
+failure, so a job cannot pass having exercised nothing.
 
 ## Reporting a vulnerability
 

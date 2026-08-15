@@ -7,9 +7,12 @@ project, see `MIGRATING.md`. This file is the "how do I actually do X" doc.
 ## First 60 seconds
 
 ```sh
-cargo install hearth-vault
+cargo install --locked --git https://github.com/warxhead1/hearth-vault
 hearth-vault init
 ```
+
+(Prebuilt binaries for Linux, macOS and Windows are on the Releases page if
+you would rather not build. Not yet on crates.io.)
 
 `init` creates the vault, prompts twice for a passphrase (hidden input), and
 prints a one-time 24-word BIP39 recovery mnemonic. Write it down — it is the
@@ -26,7 +29,9 @@ New secrets default to tier 3 (use-only): the value can never be printed by
 `export-env`/`export-env-file`, but it can still be used. Use it:
 
 ```sh
-hearth-vault exec --prefix myapp/ -- curl -H "Authorization: Bearer $API_KEY" https://api.example.com
+# Single quotes + `sh -c`, so the CHILD expands $API_KEY. With double quotes
+# your own shell expands it first, to nothing.
+hearth-vault exec --prefix myapp/ -- sh -c 'curl -H "Authorization: Bearer $API_KEY" https://api.example.com'
 ```
 
 `exec` resolves every key under `myapp/` to an env var (`myapp/api_key` ->
@@ -55,7 +60,7 @@ Before, `myapp/.env`:
 
 ```
 API_KEY=sk-...
-DATABASE_URL=postgres://user:pass@localhost/myapp
+DATABASE_URL=postgres://user:pass@localhost/myapp  # hearth-vault:allow (doc example)
 ```
 
 read by `require('dotenv').config()` at startup. After:
@@ -122,7 +127,7 @@ Let compose inherit the variables `exec` already injected.
 
 ```sh
 # ~/.zshrc — DO NOT DO THIS
-export FOO=$(hearth-vault get FOO)
+eval "$(hearth-vault export-env myapp/api_key --env-name API_KEY)"
 ```
 
 Anything `export`ed in a shell rc file is inherited by every child process
@@ -181,7 +186,7 @@ through `exec`.
 
 ```yaml
 - name: Install hearth-vault
-  run: cargo install hearth-vault
+  run: cargo install --locked --git https://github.com/warxhead1/hearth-vault
 
 - name: Run migrations
   env:
@@ -215,6 +220,23 @@ both refuse outright off-TTY unless `HEARTH_VAULT_ALLOW_NON_TTY=1` is set,
 which is an explicit opt-out for a controlled path (systemd, a CI runner you
 trust), not something to reach for by default.
 
+## Silencing a false positive in `scan`
+
+`hearth-vault scan` matches by shape, so documentation examples, test
+fixtures and sample connection strings will trip it. Mark the line rather
+than turning the scan off:
+
+```
+DATABASE_URL=postgres://user:pass@localhost/example  # hearth-vault:allow
+```
+
+`gitleaks:allow` is honoured identically, so a repo already annotated for
+gitleaks needs no second pass. There is no ignore FILE by design: an
+allowlist that lives away from the line it excuses is one nobody rereads.
+
+If you find yourself annotating a real credential to make the scan quiet,
+that is the tool working. Move the value into the vault instead.
+
 ## Rotation
 
 ### Rotate a credential end to end
@@ -230,8 +252,12 @@ Or, if the app already reads the same key name and you just need to swap the
 value in place:
 
 ```sh
-hearth-vault set myapp/api_key   # overwrites in place, same tier/prompt flow
+hearth-vault set myapp/api_key   # overwrites in place
 ```
+
+Overwriting an existing key keeps that key's current tier: rotating a value
+never changes who is allowed to read it. Pass `--tier` explicitly if you do
+want to move it.
 
 ### Rotate the vault passphrase
 
