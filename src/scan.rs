@@ -196,7 +196,7 @@ pub const RULES: &[Rule] = &[
         min_entropy: Some(3.5),
     },
     Rule {
-        // UNQUOTED values -- `DB_PASSWORD=S3cure!Passw0rd`. This is the shape
+        // UNQUOTED values -- `DB_PASSWORD=S3cure!Passw0rd`. This is the shape  // gitleaks:allow hearth-vault:allow (test fixture)
         // a dotenv file actually uses, and requiring quotes made the scanner
         // silently clean on the single most important input it has.
         //
@@ -876,10 +876,10 @@ mod tests {
     #[test]
     fn unquoted_env_assignments_are_found() {
         for line in [
-            "DB_PASSWORD=S3cure!Passw0rd",
-            "aws_secret_access_key = kX9pQmZ2vLr7TbNc4Ws8HdJf1GyUe6Ai3Ro5Pl0Q", // hearth-vault:allow (synthetic test fixture)
-            "API_TOKEN=abc123def456ghi789",
-            "export STRIPE_SECRET_KEY=rk9Xp2LmQ7vT4bN8cW5sHd1Jf3Gy", // hearth-vault:allow (synthetic test fixture)
+            "DB_PASSWORD=S3cure!Passw0rd", // gitleaks:allow hearth-vault:allow (test fixture)
+            "aws_secret_access_key = kX9pQmZ2vLr7TbNc4Ws8HdJf1GyUe6Ai3Ro5Pl0Q", // gitleaks:allow hearth-vault:allow (synthetic test fixture)
+            "API_TOKEN=abc123def456ghi789", // gitleaks:allow hearth-vault:allow (test fixture)
+            "export STRIPE_SECRET_KEY=rk9Xp2LmQ7vT4bN8cW5sHd1Jf3Gy", // gitleaks:allow hearth-vault:allow (synthetic test fixture)
         ] {
             let findings = scan_str(&format!("{line}\n"), ".env");
             assert!(
@@ -912,7 +912,7 @@ mod tests {
         let line = "let token = compute_something_long_here();\n";
         assert!(find_rule(&scan_str(line, "main.rs"), "dotenv-assignment").is_none());
         // ...but a genuinely env-shaped file still gets it.
-        let findings = scan_str("SESSION_TOKEN=9f8Xq2Lm7vT4bN8cW5sHd1J\n", ".env.production"); // hearth-vault:allow (synthetic test fixture)
+        let findings = scan_str("SESSION_TOKEN=9f8Xq2Lm7vT4bN8cW5sHd1J\n", ".env.production"); // gitleaks:allow hearth-vault:allow (synthetic test fixture)
         assert!(find_rule(&findings, "dotenv-assignment").is_some());
     }
 
