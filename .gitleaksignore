@@ -1,0 +1,12 @@
+# Findings gitleaks reports from HISTORY, which an inline `gitleaks:allow` in
+# the current tree cannot retract: the annotation only applies from the commit
+# that adds it onward.
+#
+# All four are synthetic strings in src/scan.rs's own test module. They exist
+# because the scanner MUST match that shape -- a .env-style `KEY=value` with an
+# unquoted credential -- so gitleaks agreeing with our scanner here is both
+# tools working correctly. None is a real credential; none opens anything.
+1d5fba45d4d1816eecf4f60ce6c6162a2fc2adbc:src/scan.rs:generic-api-key:880
+1d5fba45d4d1816eecf4f60ce6c6162a2fc2adbc:src/scan.rs:generic-api-key:881
+1d5fba45d4d1816eecf4f60ce6c6162a2fc2adbc:src/scan.rs:generic-api-key:882
+1d5fba45d4d1816eecf4f60ce6c6162a2fc2adbc:src/scan.rs:generic-api-key:915
