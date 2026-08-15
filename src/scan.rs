@@ -497,17 +497,9 @@ fn suggested_key_for(rule_id: &str, path: &Path, keyname: Option<&str>) -> Strin
     }
 }
 
-/// The candidate secret text and, if the pattern defines one, the assigned
-/// variable name — pulled from a regex match: prefer the `secret` named
-/// group when the pattern has one, else fall back to the whole match.
-fn extract<'a>(caps: &regex::Captures<'a>) -> (&'a str, Option<&'a str>) {
-    let (secret, _) = extract_with_span(caps);
-    let keyname = caps.name("keyname").map(|m| m.as_str());
-    (secret, keyname)
-}
-
-/// Like [`extract`], but also reports the byte range the secret occupies in
-/// the line, so overlapping rule matches can be de-duplicated.
+/// The candidate secret text — the `secret` named group when the pattern
+/// defines one, else the whole match — plus the byte range it occupies in the
+/// line, so overlapping rule matches can be de-duplicated.
 fn extract_with_span<'a>(caps: &regex::Captures<'a>) -> (&'a str, (usize, usize)) {
     match caps.name("secret").or_else(|| caps.get(0)) {
         Some(m) => (m.as_str(), (m.start(), m.end())),
@@ -696,7 +688,6 @@ mod tests {
 
     // ── Walker skip list ─────────────────────────────────────────────
 
-    #[test]
     /// A repo containing agent worktrees or tool caches must not bury the
     /// user's real findings under hits from files they do not own.
     #[test]
