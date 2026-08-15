@@ -36,7 +36,21 @@ pub fn restrict_dir_to_owner(dir: &Path) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        restrict_to_owner(dir)
+        // Deliberately a no-op.
+        //
+        // `restrict_to_owner` installs a PROTECTED DACL carrying one
+        // non-inheritable ACE. That is right for a file and wrong for a
+        // directory: stripping inherited ACEs from a directory broke creating
+        // files inside it (Windows CI caught exactly this -- every `adopt`
+        // write into a temp directory started failing). Directory ACLs need
+        // inheritance flags this helper does not model.
+        //
+        // The concrete risk being addressed -- a 0755 directory holding a
+        // 0600 vault -- is a Unix mode-bit problem. On Windows the vault file
+        // itself already carries a protected owner-only DACL, and a user
+        // profile directory is not world-listable to begin with.
+        let _ = dir;
+        Ok(())
     }
 }
 
@@ -376,6 +390,21 @@ mod tests {
 
         let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    /// Hardening a directory must not make it unusable. Windows CI caught
+    /// the version of this that installed a protected, non-inheritable DACL
+    /// on the directory: every subsequent write INTO it failed. Whatever the
+    /// platform does here, creating a file afterwards has to still work.
+    #[test]
+    fn restrict_dir_to_owner_leaves_the_directory_writable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        restrict_dir_to_owner(dir.path()).expect("restrict");
+        write_private(&dir.path().join("after.txt"), b"still writable").expect("write after");
+        assert_eq!(
+            std::fs::read(dir.path().join("after.txt")).unwrap(),
+            b"still writable"
+        );
     }
 
     /// write_private must never leave a world-readable window, and must

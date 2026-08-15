@@ -255,7 +255,11 @@ here with what happened to them.
   0700 (and the equivalent protected DACL on Windows) when they are looser
   than that. A mode that is already private, including a deliberate 0750 with
   a trusted group, is left alone, and a directory whose mode cannot be
-  changed warns rather than failing the save.
+  changed warns rather than failing the save. On Windows this is a no-op: the
+  first attempt installed the file-style protected DACL on the directory and
+  made every subsequent write into it fail (Windows CI caught it), and the
+  risk it addresses -- a loose parent directory -- is a Unix mode-bit
+  problem. The vault file on Windows already carries its own owner-only DACL.
 
 **Reviewed and deliberately not changed:**
 
