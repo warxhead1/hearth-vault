@@ -682,11 +682,11 @@ fn open_vault(vault_path: PathBuf, backend_name: Option<&str>) -> anyhow::Result
 
     if sealed_path.exists() {
         match resolve_backend(backend_name) {
-            Ok(hsm) if hsm.tier() <= 2 => {
-                if let Ok(blob) = fs::read(&sealed_path) {
-                    match hsm.unseal(&blob, "hearth-vault") {
-                        Ok(passphrase_bytes) => {
-                            if let Ok(passphrase) = String::from_utf8(passphrase_bytes.to_vec()) {
+            Ok(hsm) if hsm.tier() <= 2 => match fs::read(&sealed_path) {
+                Ok(blob) => match hsm.unseal(&blob, "hearth-vault") {
+                    Ok(passphrase_bytes) => {
+                        match String::from_utf8(passphrase_bytes.to_vec()) {
+                            Ok(passphrase) => {
                                 match VaultStore::open_at_with_passphrase(
                                     vault_path.clone(),
                                     &passphrase,
@@ -706,14 +706,36 @@ fn open_vault(vault_path: PathBuf, backend_name: Option<&str>) -> anyhow::Result
                                     }
                                 }
                             }
+                            // The unseal itself worked, so the boot chain is
+                            // fine and re-sealing is the fix — but only if we
+                            // say so. Staying quiet here sends the user
+                            // hunting the TPM for a problem that isn't there.
+                            // Never print the bytes: this is the passphrase.
+                            Err(e) => eprintln!(
+                                "Auto-unseal produced {} bytes that aren't valid UTF-8 ({e}) — \
+                                 the sealed blob predates the current vault format or was written \
+                                 by a different build. Re-seal with `hearth-vault seal`. \
+                                 Falling back to passphrase.",
+                                e.as_bytes().len()
+                            ),
                         }
-                        Err(e) => eprintln!("Auto-unseal failed (boot chain changed?): {e}"),
                     }
-                }
-            }
-            Ok(_) => {
+                    Err(e) => eprintln!("Auto-unseal failed (boot chain changed?): {e}"),
+                },
+                Err(e) => eprintln!(
+                    "Sealed passphrase at {} exists but couldn't be read ({e}) — \
+                     falling back to passphrase.",
+                    sealed_path.display()
+                ),
+            },
+            Ok(hsm) => {
                 // A backend resolved but isn't hardware-backed; auto-unseal
                 // isn't meaningful for it. Fall through to passphrase.
+                note!(
+                    "Backend {} is tier {} (not hardware-backed); skipping auto-unseal.",
+                    hsm.name(),
+                    hsm.tier()
+                );
             }
             Err(e) => note!(
                 "No secret backend available for auto-unseal ({e}); falling back to passphrase."
