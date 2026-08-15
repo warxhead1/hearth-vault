@@ -434,3 +434,16 @@ fn vault_lives_under_the_fixtures_temp_dir_not_the_real_default() {
         std::env::temp_dir()
     );
 }
+
+/// `--version` is not decoration here: the release workflow smoke-tests every
+/// artifact with it before publishing, and it is how a user confirms which
+/// build they hold when the binaries are unsigned and checksum-verified.
+#[test]
+fn version_flag_reports_the_crate_version() {
+    VaultFixture::new()
+        .cmd()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(env!("CARGO_PKG_VERSION")));
+}

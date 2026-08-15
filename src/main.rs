@@ -17,6 +17,10 @@ use zeroize::Zeroize;
 #[derive(Parser)]
 #[command(
     name = "hearth-vault",
+    // `--version` is how a user (or a release smoke test) confirms WHICH
+    // build they are holding — which matters more than usual for a tool
+    // whose releases are unsigned and verified by checksum.
+    version,
     about = "A secrets vault built so a coding agent can use your API keys without ever seeing them."
 )]
 struct Cli {
