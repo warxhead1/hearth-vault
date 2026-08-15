@@ -229,7 +229,11 @@ jobs:
         run: |
           BIN=target/x86_64-unknown-linux-musl/debug/hearth-vault
           file "$BIN"
-          if ldd "$BIN" 2>&1 | grep -qv 'not a dynamic executable'; then
+          # A dynamically linked binary lists its libraries as `lib... => path`.
+          # Static builds instead print "statically linked" or "not a dynamic
+          # executable" -- which wording depends on the loader, so match on the
+          # presence of actual dependencies rather than on either phrase.
+          if ldd "$BIN" 2>&1 | grep -q '=>'; then
             echo "FAIL: musl build is dynamically linked:"; ldd "$BIN"; exit 1
           fi
           "$BIN" --version

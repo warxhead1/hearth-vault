@@ -43,14 +43,12 @@ jobs:
             os: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
-          # musl is the "runs anywhere, no glibc" build, so it must not
-          # depend on a system D-Bus secret service either: libsecret is
-          # dynamically loaded and cannot be linked into a static binary.
-          # This artifact therefore drops os-keyring by design -- see
-          # SECURITY.md for what that means for tier availability.
+          # Full default features, keyring included: the Linux backend is
+          # zbus (pure Rust D-Bus), so nothing here needs libsecret or
+          # libdbus linked in. CI's musl job asserts the result really is
+          # static, so this is verified on every push, not assumed.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-22.04
-            features: --no-default-features
             packages: musl-tools
           - target: x86_64-apple-darwin
             os: macos-13
@@ -154,6 +152,7 @@ jobs:
             checksum above, or build from source with `cargo install
             --locked --git https://github.com/warxhead1/hearth-vault`.
 
-            The `x86_64-unknown-linux-musl` build is static and has **no
-            OS-keyring support** (libsecret cannot be statically linked).
-            Use a `-gnu` build if you want the OS-keyring tier.
+            The `x86_64-unknown-linux-musl` build is fully static and needs
+            no system libraries. It still supports the OS-keyring tier, but
+            that tier needs a Secret Service daemon running on the machine;
+            without one, `hearth-vault` falls back to the software tier.

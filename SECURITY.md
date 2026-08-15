@@ -108,19 +108,27 @@ Two things these artifacts do **not** currently give you:
   bit-for-bit guaranteed, so a checksum proves *what CI produced*, not
   independently *what the source implies*.
 
-### The musl build has no OS keyring
+### What tier 2 needs at runtime
 
-`x86_64-unknown-linux-musl` is the static, runs-on-any-distro artifact, and
-it is built with `--no-default-features`. That is deliberate rather than an
-oversight: the OS-keyring tier reaches the Secret Service over D-Bus via
-libsecret, which is dynamically loaded and cannot be linked into a static
-binary. A musl build advertising keyring support would fail at runtime on
-exactly the minimal systems it exists for.
+The OS-keyring tier stores the secret in the platform credential store, and
+that store has to actually be there and unlocked:
 
-So on the musl artifact, **tier 2 (OS keyring) is unavailable** —
-passphrase and recovery-mnemonic wrapping work normally. TPM2 (tier 1) is a
-separate opt-in feature and is in no prebuilt artifact at all. If you want
-the OS-keyring tier on Linux, use a `-gnu` build.
+- **Linux** — a Secret Service daemon (GNOME Keyring, KWallet, …) on the
+  session bus. `hearth-vault` talks D-Bus directly via zbus, so there is no
+  libsecret to install and even the static `x86_64-unknown-linux-musl`
+  artifact supports this tier. On a headless box with no such daemon, the
+  keyring reports unavailable and the software tier is used instead.
+- **macOS** — the default Keychain. **Windows** — Credential Manager.
+
+A **locked** keyring is the awkward case: it answers reads immediately but
+blocks writes waiting on an unlock prompt, which an SSH session, a CI job, or
+an agent tool call cannot answer. Rather than hang, every keyring operation
+runs under a deadline (30s by default,
+`HEARTH_VAULT_KEYRING_TIMEOUT_SECS` to change) and fails with a message
+naming the cause.
+
+TPM2 (tier 1) is a separate opt-in build feature and is in no prebuilt
+artifact at all; it must be compiled in with `--features tpm2`.
 
 ## Reporting a vulnerability
 
