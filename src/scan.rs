@@ -365,6 +365,10 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 const SKIP_FILE_NAMES: &[&str] = &[
+    // A file of allowlisted findings, by definition. Its git-SHA
+    // fingerprints are 40-char hex, which the high-entropy rule cannot tell
+    // from a secret -- and flagging the allowlist is a loop.
+    ".gitleaksignore",
     "Cargo.lock",
     "package-lock.json",
     "yarn.lock",
