@@ -129,8 +129,15 @@ impl Default for OsKeyringBackend {
 
 impl SecretBackend for OsKeyringBackend {
     fn seal(&self, plaintext: &[u8], label: &str) -> Result<Vec<u8>, HsmError> {
-        // Encode as hex for keyring storage (keyring stores strings)
-        let hex: String = plaintext.iter().map(|b| format!("{b:02x}")).collect();
+        // Encode as hex for keyring storage (keyring stores strings). This
+        // string IS the master key in the clear; it is moved into the worker
+        // closure, so it is wrapped rather than left to an ordinary drop.
+        let hex = Zeroizing::new(
+            plaintext
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        );
         let owned_label = label.to_string();
         with_deadline(op_timeout(), move || {
             let entry = Entry::new(SERVICE_NAME, &owned_label).map_err(|e| e.to_string())?;
@@ -144,14 +151,16 @@ impl SecretBackend for OsKeyringBackend {
 
     fn unseal(&self, blob: &[u8], label: &str) -> Result<Zeroizing<Vec<u8>>, HsmError> {
         let stored_label = std::str::from_utf8(blob).unwrap_or(label).to_string();
-        let hex = with_deadline(op_timeout(), move || {
-            let entry = Entry::new(SERVICE_NAME, &stored_label).map_err(|e| e.to_string())?;
-            entry
-                .get_password()
-                .map_err(|e| format!("keyring read failed: {e}"))
-        })
-        .ok_or_else(|| HsmError::UnsealFailed(timeout_error("read")))?
-        .map_err(HsmError::UnsealFailed)?;
+        let hex = Zeroizing::new(
+            with_deadline(op_timeout(), move || {
+                let entry = Entry::new(SERVICE_NAME, &stored_label).map_err(|e| e.to_string())?;
+                entry
+                    .get_password()
+                    .map_err(|e| format!("keyring read failed: {e}"))
+            })
+            .ok_or_else(|| HsmError::UnsealFailed(timeout_error("read")))?
+            .map_err(HsmError::UnsealFailed)?,
+        );
         let bytes = hex_decode(&hex)
             .map_err(|_| HsmError::UnsealFailed("invalid hex in keyring".into()))?;
         Ok(Zeroizing::new(bytes))

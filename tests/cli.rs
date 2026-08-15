@@ -233,6 +233,40 @@ fn set_preserves_the_tier_of_an_existing_key() {
     );
 }
 
+/// Tier 4 must be a one-way door. If `retier` can walk a sign-only key back
+/// down to an exportable tier, then tier 4 is advice, not a control: anything
+/// that can run the binary could downgrade a signing key and export it on the
+/// next line, with no proof it ever held the value.
+#[test]
+fn tier_four_cannot_be_downgraded_by_retier() {
+    let fx = VaultFixture::new();
+
+    fx.cmd()
+        .args(["set", "myapp/signing-key", "--tier", "4"])
+        .write_stdin("sign-only-fixture-value\n")
+        .assert()
+        .success();
+
+    fx.cmd()
+        .args(["retier", "myapp/signing-key", "--tier", "2"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("refusing to lower"));
+
+    // ...and it is still tier 4 afterwards.
+    let assert = fx.cmd().arg("list").assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let row = stdout
+        .lines()
+        .find(|l| l.contains("myapp/signing-key"))
+        .unwrap_or_else(|| panic!("no row for signing-key:\n{stdout}"));
+    assert_eq!(
+        row.split_whitespace().nth(1),
+        Some("4"),
+        "tier must be unchanged after a refused downgrade, row was: {row}"
+    );
+}
+
 // ── tier-3 exec injection + env-name mapping ────────────────────────────
 
 /// `exec --prefix myapp/ -- <cmd>` puts tier-3 (default) values into the
@@ -241,7 +275,7 @@ fn set_preserves_the_tier_of_an_existing_key() {
 #[test]
 fn exec_injects_tier3_with_prefix_name_mapping() {
     let fx = VaultFixture::new();
-    let secret_value = "exec-injection-fixture-value-42";
+    let secret_value = "exec-injection-fixture-value-42"; // hearth-vault:allow (test fixture, not a credential)
 
     fx.cmd()
         .args(["set", "myapp/api-key", "--tier", "3"])
@@ -272,7 +306,7 @@ fn exec_injects_tier3_with_prefix_name_mapping() {
 #[test]
 fn exec_maps_hyphen_to_underscore_in_env_name() {
     let fx = VaultFixture::new();
-    let secret_value = "hyphen-mapping-fixture-value";
+    let secret_value = "hyphen-mapping-fixture-value"; // hearth-vault:allow (test fixture, not a credential)
 
     fx.cmd()
         .args(["set", "myapp/db-password", "--tier", "3"])
@@ -381,7 +415,7 @@ fn export_env_refuses_non_tty_and_allows_with_override() {
 #[test]
 fn exec_succeeds_without_tty_override() {
     let fx = VaultFixture::new();
-    let secret_value = "exec-no-override-fixture-value";
+    let secret_value = "exec-no-override-fixture-value"; // hearth-vault:allow (test fixture, not a credential)
 
     fx.cmd()
         .args(["set", "myapp/token", "--tier", "2"])

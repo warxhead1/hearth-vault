@@ -196,6 +196,94 @@ every platform at once. `HEARTH_VAULT_REQUIRE_KEYRING=1` and
 `HEARTH_VAULT_REQUIRE_TPM2=1` turn "no backend here" from a skip into a
 failure, so a job cannot pass having exercised nothing.
 
+## Adversarial review
+
+An independent adversarial pass (an AI agent driven with a falsify-these-nine-
+claims brief, 2026-08-15, against commit `36dc654`) went looking for ways to
+get a secret out. Findings were re-verified by hand before anything was
+changed; several did not survive that check, and the ones that did are listed
+here with what happened to them.
+
+**Fixed as a result:**
+
+- **The non-TTY guard only inspected stdout.** The recovery mnemonic banner
+  and all prompts go to *stderr*, so `hearth-vault init 2>mnemonic.log` from
+  an ordinary terminal wrote the 24 words that unlock the entire vault into a
+  plaintext file, guard satisfied. Both streams are now required.
+- **Tier 4 was not a one-way door.** `retier <key> --tier 2` walked a
+  sign-only key back to exportable with no prompt, no TTY requirement and no
+  proof the caller ever held the value — so anything able to run the binary
+  could downgrade a signing key and export it on the next line. Leaving tier 4
+  is now refused outright; deleting and re-adding the key is the path, because
+  that requires possessing the value.
+- **Vault writes were neither atomic nor owner-only from creation.** The old
+  path truncated the destination in place and applied permissions *after*
+  writing, so a crash mid-save destroyed every secret in the vault, and the
+  content existed briefly at the process umask (commonly world-readable). It
+  also followed a symlink planted at the destination. All secret-bearing
+  writes now go through one helper that creates a temp file at 0600, fsyncs,
+  and renames into place.
+- **KDF parameters were taken from the vault file unbounded.** They have to be
+  used *before* anything can be authenticated, so a hostile file could ask for
+  `m = u32::MAX` (about 4 TiB) or `t = u32::MAX` (never returns). Now range-
+  checked at the single point every derivation funnels through.
+- **The secret scanner missed unquoted assignments entirely.** Its generic
+  rule required quotes around the value, so a `.env` file — the one input the
+  whole migration story starts from — full of live credentials reported clean.
+  Unquoted `KEY=value` is now matched in env-style files (scoped there because
+  in source code a bare `token = x` is an ordinary assignment; letting it
+  loose produced ~60 false positives on this repository alone).
+- **`scan` silently skipped files over 1 MiB.** "No secrets found" over an
+  unread 4 MiB `.env.backup` is the worst answer this tool can give. Skips are
+  now printed.
+- **Zeroization had holes.** The fix was structural rather than a list of
+  patches: `decrypt_aes256gcm` now returns `Zeroizing<Vec<u8>>`, so every
+  decryption in the crate -- vault body, wrapped data key, PEM private key --
+  is wiped on drop whether or not the caller remembers. The remaining
+  hand-carried copies were wrapped too: the serialized vault body on its way
+  into the encryptor, the hex-encoded master key crossing into the keyring,
+  the decoded private-key DER, and the recovery mnemonic (now returned as
+  `Zeroizing<String>`).
+- **The scanner's overlap de-duplication was quadratic.** Every candidate
+  match was compared against every span already claimed on that line, so one
+  pathological line with tens of thousands of secret-shaped tokens turned a
+  scan into a hang. It is a byte map now: linear in the matched text.
+- **Directories holding secrets were not restricted.** A 0600 vault inside a
+  0755 directory still lets another local user list it, see its mtime, and --
+  if the directory is writable -- rename or replace files in it. The vault
+  directory and any `export-env-file` output directory are now tightened to
+  0700 (and the equivalent protected DACL on Windows) when they are looser
+  than that. A mode that is already private, including a deliberate 0750 with
+  a trusted group, is left alone, and a directory whose mode cannot be
+  changed warns rather than failing the save.
+
+**Reviewed and deliberately not changed:**
+
+- *"`exec -- printenv TOKEN` prints a tier-3 secret."* Correct, and by design:
+  `exec` hands the value to the command you named. It is documented in the
+  threat model above and in README's Limitations. A tool that gives a child
+  process a credential cannot also stop that child from printing it.
+- *"Recovery rotation persists before the new phrase is displayed."* True, and
+  the safer of the two orders: if the display is lost the vault still opens
+  with the passphrase, whereas displaying first would risk showing a phrase
+  that was never stored.
+- *v1 migration decrypts with empty AAD.* Deliberate and documented in the
+  code: it reads data written before AAD existed. The related observation is
+  real though — v1 stored tier metadata unauthenticated, so anyone who could
+  write to a v1 vault file could have altered a tier before you migrated.
+  **If you are migrating a v1 vault, check `hearth-vault list` tiers
+  afterwards.**
+
+Everything the review raised that was verifiable has been fixed or is
+explained above. That is still not a substitute for a paid external audit,
+which this project has not had.
+
+The structural caveats that remain are the ones in the threat model, not
+oversights: zeroization narrows the window a secret sits in memory but cannot
+defend against a privileged process reading that memory or the OS swapping the
+page out, and nothing here constrains what a command you `exec` into does with
+a credential once it has one.
+
 ## Reporting a vulnerability
 
 Please do not open a public GitHub issue for a security vulnerability.

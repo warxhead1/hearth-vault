@@ -372,13 +372,19 @@ fn should_refuse_non_tty(stdout_is_tty: bool, allow_override: bool) -> bool {
 /// to rot as new tools ship; "is this stdout a pipe or a terminal" is not.
 /// `exec` is deliberately exempt — see its doc comment.
 fn refuse_if_non_tty(cmd: &str) -> anyhow::Result<()> {
-    let stdout_is_tty = platform::stdout_is_tty();
+    // BOTH streams, not just stdout. Values go to stdout, but the recovery
+    // mnemonic banner and every warning go to stderr -- so checking stdout
+    // alone let `hearth-vault init 2>mnemonic.log` write the 24 words that
+    // unlock the whole vault into a plaintext file from an ordinary
+    // interactive terminal. A human at a real terminal has both; a redirect
+    // of either is the case this guard exists to refuse.
+    let both_are_tty = platform::stdout_is_tty() && platform::stderr_is_tty();
     let allow_override =
         std::env::var("HEARTH_VAULT_ALLOW_NON_TTY").is_ok_and(|v| v != "0" && !v.is_empty());
-    if should_refuse_non_tty(stdout_is_tty, allow_override) {
+    if should_refuse_non_tty(both_are_tty, allow_override) {
         anyhow::bail!(
-            "`{cmd}` writes a secret value and refuses to run with stdout redirected (not a \
-             terminal). If this is an intentional systemd/CI invocation, set \
+            "`{cmd}` writes a secret value and refuses to run with stdout or stderr redirected \
+             (not a terminal). If this is an intentional systemd/CI invocation, set \
              HEARTH_VAULT_ALLOW_NON_TTY=1. If you're an automation or agent that needs the \
              secret's *effect* rather than its raw value, use `hearth-vault exec --prefix \
              <prefix> -- <command>` instead — it injects secrets into a child process's \
@@ -1025,6 +1031,24 @@ fn cmd_retier(
     let prev_tier = store
         .tier_of(key)
         .ok_or_else(|| anyhow::anyhow!("key not found: {key}"))?;
+
+    // Tier 4 is a one-way door, and it has to be, or it is not a tier at all.
+    // Its entire promise is "this value is never printed and never injected --
+    // only `sign` can use it". A `retier ... --tier 2` that walks that back
+    // costs nothing and needs no secret, so without this refusal anything
+    // able to run the binary could downgrade a signing key and then export it
+    // in the next command. Re-adding the key requires possessing the value
+    // again, which is exactly the proof of intent that should be required.
+    if prev_tier == TIER_SIGN_ONLY && tier != TIER_SIGN_ONLY {
+        anyhow::bail!(
+            "refusing to lower '{key}' from tier {TIER_SIGN_ONLY} (sign-only) to tier {tier}.\n\
+             Tier {TIER_SIGN_ONLY} means the value is never printed and never injected into any \
+             process -- a downgrade would undo that with no proof you hold the value.\n\
+             If you genuinely mean to, delete the key and store it again at the tier you want:\n\
+             \n    hearth-vault delete {key}\n    hearth-vault set {key} --tier {tier}\n"
+        );
+    }
+
     store.retier(key, tier)?;
     store.save()?;
     eprintln!("  \u{2713} {key}: tier {prev_tier} -> {tier}");
@@ -1338,11 +1362,19 @@ fn cmd_export_env_file(
     let path = PathBuf::from(output_path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        if let Err(e) = platform::restrict_dir_to_owner(parent) {
+            eprintln!(
+                "warning: could not restrict permissions on {}: {e}",
+                parent.display()
+            );
+        }
     }
 
-    // Write file
-    fs::write(&path, content.as_bytes())?;
-    platform::restrict_to_owner(&path)?;
+    // Write file. Owner-only from creation and via a rename, so the
+    // plaintext is never briefly world-readable and a symlink planted at the
+    // output path cannot redirect it (this file is the one place the tool
+    // deliberately puts secrets on disk, so it gets the careful path).
+    platform::write_private(&path, content.as_bytes())?;
 
     eprintln!(
         "Exported {} key(s) with prefix '{}' to {}",
@@ -1684,6 +1716,9 @@ fn sign_with_key(
         // PKCS#1 ("RSA PRIVATE KEY") for GitHub App keys and similar.
         let (label, der_bytes) = pem_rfc7468::decode_vec(pem_string.as_bytes())
             .map_err(|e| anyhow::anyhow!("failed to decode PEM: {e}"))?;
+        // The DER is the private key with the PEM armour removed -- exactly
+        // as secret as the PEM string this function is careful to wipe.
+        let der_bytes = zeroize::Zeroizing::new(der_bytes);
         let key_pair: RsaKeyPair = match label {
             "PRIVATE KEY" => {
                 // PKCS#8 DER — ring can parse this directly.

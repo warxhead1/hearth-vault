@@ -7,6 +7,112 @@
 
 use std::path::Path;
 
+/// Restrict a DIRECTORY that holds secret files to its owner (`0700` on
+/// Unix; the same single-ACE protected DACL on Windows).
+///
+/// A 0600 vault file inside a 0755 directory is fine for confidentiality --
+/// another local user cannot read the file -- but they CAN list the
+/// directory, learn that you use this tool, see the vault's mtime, and, if
+/// the directory is writable by them, rename or replace files in it. The
+/// directory is part of the secret's containment, so it gets tightened too.
+///
+/// Never fails the caller: a vault living in a directory whose mode cannot be
+/// changed (a mount with restricted permissions, a shared parent someone else
+/// owns) is a reason to warn, not a reason to refuse to save.
+pub fn restrict_dir_to_owner(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(dir)?;
+        let mode = meta.permissions().mode() & 0o777;
+        // Only touch it if it is actually loose, so a deliberately chosen
+        // 0750 with a trusted group is left alone.
+        if mode & 0o077 != 0 {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(dir, perms)?;
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        restrict_to_owner(dir)
+    }
+}
+
+/// Write secret-bearing bytes to `path` so that the file is never, at any
+/// instant, readable by anyone but its owner, and so that a crash cannot
+/// leave a half-written file behind.
+///
+/// The naive `fs::write` + `restrict_to_owner` sequence gets both wrong:
+///
+///   - The content lands with the process umask (commonly 0644) and is only
+///     narrowed afterwards, so there is a window where another local user can
+///     read it. `fs::write` also FOLLOWS a symlink at `path`, which lets an
+///     attacker who can create one aim the plaintext wherever they like.
+///   - `fs::write` truncates the destination first. A crash, a full disk or a
+///     killed process between truncate and completion leaves a truncated
+///     vault -- every secret in it gone, with no copy anywhere.
+///
+/// So: create a fresh temp file beside the destination with owner-only
+/// permissions AT CREATION, write, fsync, then rename over the destination.
+/// Rename replaces whatever is at `path` (including a symlink, as the link
+/// rather than through it) in one step.
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.tmp.{}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("vault"),
+        std::process::id()
+    ));
+    // A stale temp from a previous crash must not make this fail.
+    let _ = std::fs::remove_file(&tmp);
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let mut f = opts.open(&tmp)?;
+    let write_result = f
+        .write_all(bytes)
+        // fsync: a rename is atomic with respect to ordering, but on a crash
+        // an unsynced file can be renamed into place with zero length.
+        .and_then(|_| f.sync_all());
+    drop(f);
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Windows has no mode bits; apply the DACL before the file is reachable
+    // under its real name.
+    #[cfg(windows)]
+    if let Err(e) = restrict_to_owner(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // On Unix this replaces the destination atomically. On Windows, rename
+    // onto an existing file fails, so remove first -- a brief window where
+    // the destination is absent, which is still strictly better than the
+    // truncate-in-place it replaces.
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(path);
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Restrict a file to the current user only.
 ///
 /// Unix: `chmod 0600`.
@@ -190,11 +296,22 @@ pub fn stdout_is_tty() -> bool {
     unsafe { libc::isatty(1) == 1 }
 }
 
+/// Is stderr a terminal?
+///
+/// This matters as much as stdout: prompts, warnings AND the recovery
+/// mnemonic banner are written to stderr, so a guard that only inspects
+/// stdout leaves `hearth-vault init 2>mnemonic.log` writing the phrase that
+/// unlocks the whole vault into a plaintext file, from a session whose
+/// stdout is a perfectly ordinary terminal.
+#[cfg(unix)]
+pub fn stderr_is_tty() -> bool {
+    // SAFETY: as above, for file descriptor 2.
+    unsafe { libc::isatty(2) == 1 }
+}
+
 #[cfg(windows)]
-pub fn stdout_is_tty() -> bool {
-    use windows_sys::Win32::System::Console::{
-        CONSOLE_MODE, GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE,
-    };
+fn handle_is_console(which: windows_sys::Win32::System::Console::STD_HANDLE) -> bool {
+    use windows_sys::Win32::System::Console::{CONSOLE_MODE, GetConsoleMode, GetStdHandle};
 
     // SAFETY: GetStdHandle/GetConsoleMode are simple Win32 queries with no
     // caller-owned pointers except the output `mode`, which is a valid local
@@ -202,7 +319,7 @@ pub fn stdout_is_tty() -> bool {
     // which we correctly treat as "not a console/TTY" (e.g. redirected to a
     // file or pipe).
     unsafe {
-        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        let handle = GetStdHandle(which);
         if handle.is_null() {
             return false;
         }
@@ -211,9 +328,86 @@ pub fn stdout_is_tty() -> bool {
     }
 }
 
+#[cfg(windows)]
+pub fn stderr_is_tty() -> bool {
+    handle_is_console(windows_sys::Win32::System::Console::STD_ERROR_HANDLE)
+}
+
+#[cfg(windows)]
+pub fn stdout_is_tty() -> bool {
+    handle_is_console(windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The vault file being 0600 is not enough on its own: another local
+    /// user must not be able to list, rename, or replace things in the
+    /// directory holding it.
+    #[cfg(unix)]
+    #[test]
+    fn restrict_dir_to_owner_tightens_a_loose_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        restrict_dir_to_owner(dir.path()).expect("restrict");
+
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "expected 0700, got {mode:o}");
+    }
+
+    /// A deliberately chosen group-shared mode with no other-access is left
+    /// alone; this function tightens what is loose, it does not enforce a
+    /// house style.
+    #[cfg(unix)]
+    #[test]
+    fn restrict_dir_to_owner_leaves_an_already_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        restrict_dir_to_owner(dir.path()).expect("restrict");
+
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    /// write_private must never leave a world-readable window, and must
+    /// replace the destination rather than following a symlink out of it.
+    #[cfg(unix)]
+    #[test]
+    fn write_private_creates_owner_only_and_replaces_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("elsewhere.txt");
+        let dest = dir.path().join("vault.json");
+
+        write_private(&dest, b"first").expect("write");
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+
+        // Point the destination at another file; the write must replace the
+        // link itself, leaving the target untouched.
+        std::fs::remove_file(&dest).unwrap();
+        std::fs::write(&target, b"do not overwrite me").unwrap();
+        std::os::unix::fs::symlink(&target, &dest).unwrap();
+
+        write_private(&dest, b"second").expect("write over symlink");
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not overwrite me");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"second");
+        assert!(
+            !std::fs::symlink_metadata(&dest)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     #[test]
     fn test_restrict_to_owner_produces_owner_only_perms() {

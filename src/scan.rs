@@ -186,8 +186,29 @@ pub const RULES: &[Rule] = &[
     Rule {
         id: "generic-assignment",
         description: "Suspicious key/secret/token/password assignment (entropy-gated)",
-        pattern: r#"(?i)(?P<keyname>api[_-]?key|secret|token|password|passwd|pwd|credential|auth)["']?\s*[:=]\s*["'](?P<secret>[^"']{8,})["']"#,
+        // Quoted values, any file. The trailing `[a-z0-9_-]*` lets the
+        // keyword match inside a longer name: `aws_secret_access_key`,
+        // `STRIPE_API_KEY_LIVE`.
+        pattern: r#"(?i)(?P<keyname>api[_-]?key|secret|token|password|passwd|pwd|credential|auth)[a-z0-9_-]*["']?\s*[:=]\s*["'](?P<secret>[^"'\r\n]{8,})["']"#,
+        // 3.5, not the dotenv rule's 3.2: quoted assignments are everywhere in
+        // source code, so this threshold buys precision. Lowering it to 3.2
+        // starts flagging test fixture strings in this very repository.
         min_entropy: Some(3.5),
+    },
+    Rule {
+        // UNQUOTED values -- `DB_PASSWORD=S3cure!Passw0rd`. This is the shape
+        // a dotenv file actually uses, and requiring quotes made the scanner
+        // silently clean on the single most important input it has.
+        //
+        // Restricted to dotenv-style files (see DOTENV_ONLY_RULE): in source
+        // code a bare `token = something` is an ordinary assignment, and
+        // letting this loose on .rs/.py/.js produced ~60 false positives on
+        // this repository alone. A real secret in source is a string literal,
+        // which generic-assignment above already covers.
+        id: "dotenv-assignment",
+        description: "Unquoted secret assignment in an env file (entropy-gated)",
+        pattern: r#"(?i)(?P<keyname>api[_-]?key|secret|token|password|passwd|pwd|credential|auth)[a-z0-9_-]*\s*[:=]\s*(?P<secret>[^"'\s#][^\s#]{7,})"#,
+        min_entropy: Some(3.2),
     },
     Rule {
         id: "generic-high-entropy-base64",
@@ -426,6 +447,14 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
             if let Ok(meta) = entry.metadata()
                 && meta.len() > MAX_SCAN_FILE_SIZE
             {
+                // Say so. A silent skip reads exactly like a clean file, and
+                // "No secrets found" over an unread 4 MiB .env.backup is the
+                // worst answer this tool can give.
+                eprintln!(
+                    "  skipped (larger than {} MiB): {}",
+                    MAX_SCAN_FILE_SIZE / (1024 * 1024),
+                    path.display()
+                );
                 continue;
             }
             if looks_binary(&path) {
@@ -507,6 +536,27 @@ fn extract_with_span<'a>(caps: &regex::Captures<'a>) -> (&'a str, (usize, usize)
     }
 }
 
+/// The one rule that only applies to dotenv-style files. See its entry in
+/// `RULES` for why it cannot be let loose on source code.
+const DOTENV_ONLY_RULE: &str = "dotenv-assignment";
+
+/// Is this a file whose convention is `KEY=value` with unquoted values?
+///
+/// Covers `.env`, `.env.local`, `.env.production`, `prod.env`, `.envrc`, and
+/// the `environment` file systemd units use. Deliberately narrow: widening it
+/// re-admits the false positives that made the unquoted rule unusable.
+fn is_dotenv_style(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower == "environment"
+        || lower == ".envrc"
+        || lower == ".env"
+        || lower.starts_with(".env.")
+        || lower.ends_with(".env")
+}
+
 // ── Public entry point ───────────────────────────────────────────────────
 
 /// Scan every eligible file under `root` (or `root` itself, if it's a
@@ -538,13 +588,25 @@ pub fn scan_path(root: &Path) -> anyhow::Result<Vec<Finding>> {
             // key, once as an OpenAI key (the prefixes overlap), and once by
             // the high-entropy safety net. Triplicated findings make the
             // report look broken and bury the real count.
-            let mut claimed: Vec<(usize, usize)> = Vec::new();
+            // A byte map rather than a list of ranges: the list version was
+            // O(matches^2) -- every candidate compared against every span
+            // already claimed -- so one pathological line with tens of
+            // thousands of secret-shaped tokens turned a scan into a hang.
+            // Marking and testing bytes is linear in the matched text.
+            let mut claimed = vec![false; line.len()];
+            let len_guard = claimed.len();
 
             for compiled in COMPILED_RULES.iter() {
+                if compiled.rule.id == DOTENV_ONLY_RULE && !is_dotenv_style(&file) {
+                    continue;
+                }
                 for caps in compiled.regex.captures_iter(line) {
                     let (secret_str, span) = extract_with_span(&caps);
                     let keyname = caps.name("keyname").map(|m| m.as_str());
-                    if claimed.iter().any(|&(s, e)| span.0 < e && s < span.1) {
+                    if claimed[span.0..span.1.min(claimed.len())]
+                        .iter()
+                        .any(|&taken| taken)
+                    {
                         continue;
                     }
                     if secret_str.is_empty() || is_placeholder(secret_str) {
@@ -567,7 +629,9 @@ pub fn scan_path(root: &Path) -> anyhow::Result<Vec<Finding>> {
                         continue;
                     }
 
-                    claimed.push(span);
+                    for taken in &mut claimed[span.0..span.1.min(len_guard)] {
+                        *taken = true;
+                    }
                     findings.push(Finding {
                         rule_id: compiled.rule.id.to_string(),
                         path: file.clone(),
@@ -802,6 +866,54 @@ mod tests {
         let content = format!("token = \"{secret}\" # hearth-vault:allow\n");
         let findings = scan_str(&content, "file.txt");
         assert!(findings.is_empty());
+    }
+
+    // ── Unquoted dotenv assignments ──────────────────────────────────
+
+    /// The shape a real `.env` file uses. Requiring quotes made the scanner
+    /// report a file full of live credentials as clean, which is the worst
+    /// possible failure for a tool whose migration story starts with `scan`.
+    #[test]
+    fn unquoted_env_assignments_are_found() {
+        for line in [
+            "DB_PASSWORD=S3cure!Passw0rd",
+            "aws_secret_access_key = kX9pQmZ2vLr7TbNc4Ws8HdJf1GyUe6Ai3Ro5Pl0Q", // hearth-vault:allow (synthetic test fixture)
+            "API_TOKEN=abc123def456ghi789",
+            "export STRIPE_SECRET_KEY=rk9Xp2LmQ7vT4bN8cW5sHd1Jf3Gy", // hearth-vault:allow (synthetic test fixture)
+        ] {
+            let findings = scan_str(&format!("{line}\n"), ".env");
+            assert!(
+                !findings.is_empty(),
+                "missed an unquoted credential: {line}"
+            );
+        }
+    }
+
+    /// Ordinary non-secret config in the same file must stay quiet, or the
+    /// report is noise and people turn the scan off.
+    #[test]
+    fn unquoted_non_secrets_are_not_flagged() {
+        for line in [
+            "DEBUG=true",
+            "PORT=8080",
+            "LOG_LEVEL=info",
+            "password = \"\"",
+        ] {
+            let findings = scan_str(&format!("{line}\n"), ".env");
+            assert!(findings.is_empty(), "false positive on: {line}");
+        }
+    }
+
+    /// The unquoted rule is scoped to env-style files on purpose: in source
+    /// code `let token = something` is an ordinary assignment, and letting
+    /// this rule loose there produced ~60 false positives on this repo.
+    #[test]
+    fn unquoted_rule_does_not_fire_in_source_files() {
+        let line = "let token = compute_something_long_here();\n";
+        assert!(find_rule(&scan_str(line, "main.rs"), "dotenv-assignment").is_none());
+        // ...but a genuinely env-shaped file still gets it.
+        let findings = scan_str("SESSION_TOKEN=9f8Xq2Lm7vT4bN8cW5sHd1J\n", ".env.production"); // hearth-vault:allow (synthetic test fixture)
+        assert!(find_rule(&findings, "dotenv-assignment").is_some());
     }
 
     // ── Rule matching: one positive + one placeholder-negative per family ─

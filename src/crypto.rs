@@ -13,6 +13,7 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha3::Sha3_256;
+use zeroize::Zeroizing;
 
 /// Errors from cryptographic operations.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +43,46 @@ pub struct KdfParams {
     pub t: u32,
     /// Parallelism (lanes).
     pub p: u32,
+}
+
+impl KdfParams {
+    /// Reject parameters that cannot have come from a vault this tool wrote.
+    ///
+    /// These values are read from the vault FILE, which is untrusted input:
+    /// they have to be used to derive the key *before* anything can be
+    /// authenticated, so a hostile or corrupt file gets to choose how much
+    /// work and memory we do. `m = u32::MAX` asks Argon2 for roughly 4 TiB;
+    /// `t = u32::MAX` never returns. Neither is a decryption failure -- it is
+    /// a crash or a hang, in a tool other programs shell out to.
+    ///
+    /// The ceiling is generous (4 GiB, 64 passes, 64 lanes): far above any
+    /// sane hardening choice, far below anything that takes the process out.
+    /// The floor is the smallest thing Argon2 itself accepts.
+    pub fn validate(&self) -> Result<(), CryptoError> {
+        const MAX_M_KIB: u32 = 4 * 1024 * 1024; // 4 GiB
+        const MAX_T: u32 = 64;
+        const MAX_P: u32 = 64;
+
+        if self.m < 8 || self.m > MAX_M_KIB {
+            return Err(CryptoError::KeyDerivation(format!(
+                "vault KDF memory parameter out of range: {} KiB (accepted: 8..={MAX_M_KIB})",
+                self.m
+            )));
+        }
+        if self.t == 0 || self.t > MAX_T {
+            return Err(CryptoError::KeyDerivation(format!(
+                "vault KDF iteration parameter out of range: {} (accepted: 1..={MAX_T})",
+                self.t
+            )));
+        }
+        if self.p == 0 || self.p > MAX_P {
+            return Err(CryptoError::KeyDerivation(format!(
+                "vault KDF parallelism parameter out of range: {} (accepted: 1..={MAX_P})",
+                self.p
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Default for KdfParams {
@@ -83,11 +124,17 @@ pub fn encrypt_aes256gcm(
 }
 
 /// Decrypt nonce || ciphertext with AES-256-GCM, verifying `aad`.
+///
+/// The plaintext comes back in a `Zeroizing<Vec<u8>>` deliberately: every
+/// decryption in this crate produces secret material -- the vault body, a
+/// wrapped data key, a PEM private key -- and returning a bare `Vec<u8>`
+/// meant each caller had to remember to wipe it, which several did not.
+/// Wrapping it here makes forgetting impossible.
 pub fn decrypt_aes256gcm(
     key: &[u8; KEY_SIZE],
     data: &[u8],
     aad: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     if data.len() < NONCE_SIZE + 16 {
         // Minimum: nonce + GCM tag
         return Err(CryptoError::InvalidFormat("data too short".into()));
@@ -104,6 +151,7 @@ pub fn decrypt_aes256gcm(
             },
         )
         .map_err(|_| CryptoError::DecryptionFailed)
+        .map(Zeroizing::new)
 }
 
 // ── Argon2id Key Derivation ────────────────────────────────────────────────
@@ -116,6 +164,10 @@ pub fn derive_key_argon2id(
     salt: &[u8; 32],
     params: KdfParams,
 ) -> Result<[u8; KEY_SIZE], CryptoError> {
+    // Guard here rather than at each call site: `params` reaches this
+    // function straight out of the vault file, which is untrusted input, and
+    // this is the one place every path funnels through.
+    params.validate()?;
     let argon2_params = Params::new(params.m, params.t, params.p, Some(KEY_SIZE))
         .map_err(|e| CryptoError::KeyDerivation(e.to_string()))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon2_params);
@@ -160,6 +212,58 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod kdf_bounds_tests {
+    use super::*;
+
+    /// Parameters come from the vault file, i.e. from an attacker if they can
+    /// hand you a file. Absurd values must be a clean error, not a 4 TiB
+    /// allocation or a call that never returns.
+    #[test]
+    fn hostile_kdf_params_are_rejected_before_any_work_happens() {
+        let salt = [7u8; 32];
+        for bad in [
+            KdfParams {
+                m: u32::MAX,
+                t: 3,
+                p: 4,
+            },
+            KdfParams {
+                m: 65536,
+                t: u32::MAX,
+                p: 4,
+            },
+            KdfParams {
+                m: 65536,
+                t: 3,
+                p: u32::MAX,
+            },
+            KdfParams { m: 0, t: 3, p: 4 },
+            KdfParams {
+                m: 65536,
+                t: 0,
+                p: 4,
+            },
+            KdfParams {
+                m: 65536,
+                t: 3,
+                p: 0,
+            },
+        ] {
+            assert!(
+                derive_key_argon2id(b"passphrase", &salt, bad).is_err(),
+                "accepted hostile KDF params: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_params_still_derive() {
+        let salt = [7u8; 32];
+        assert!(derive_key_argon2id(b"passphrase", &salt, KdfParams::default()).is_ok());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -172,7 +276,7 @@ mod tests {
         let encrypted = encrypt_aes256gcm(&key, plaintext, AAD).unwrap();
         assert_ne!(&encrypted, plaintext);
         let decrypted = decrypt_aes256gcm(&key, &encrypted, AAD).unwrap();
-        assert_eq!(&decrypted, plaintext);
+        assert_eq!(decrypted.as_slice(), plaintext);
     }
 
     #[test]
@@ -209,7 +313,9 @@ mod tests {
         assert!(decrypt_aes256gcm(&key, &encrypted, b"context-b").is_err());
         assert!(decrypt_aes256gcm(&key, &encrypted, b"").is_err());
         assert_eq!(
-            decrypt_aes256gcm(&key, &encrypted, b"context-a").unwrap(),
+            decrypt_aes256gcm(&key, &encrypted, b"context-a")
+                .unwrap()
+                .as_slice(),
             b"payload"
         );
     }

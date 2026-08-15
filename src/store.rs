@@ -28,7 +28,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{self, KdfParams};
 use crate::sensitive::SensitiveString;
@@ -305,9 +305,20 @@ impl VaultStore {
     pub fn save(&self) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
+            // The directory is part of the containment, not just the file.
+            // A warning, not a failure: an unchangeable parent is a reason to
+            // tell the user, not to refuse to save their vault.
+            if let Err(e) = crate::hsm::platform::restrict_dir_to_owner(parent) {
+                eprintln!(
+                    "warning: could not restrict permissions on {}: {e}",
+                    parent.display()
+                );
+            }
         }
 
-        let body_json = serde_json::to_vec(&self.body)?;
+        // The serialized body is every secret in the vault, in the clear,
+        // right up to the encrypt call below. Wipe it on the way out.
+        let body_json = zeroize::Zeroizing::new(serde_json::to_vec(&self.body)?);
         let vault_blob = crypto::encrypt_aes256gcm(&self.data_key, &body_json, AAD_VAULT)
             .map_err(|e| anyhow::anyhow!("failed to encrypt vault body: {e}"))?;
 
@@ -322,9 +333,11 @@ impl VaultStore {
         };
 
         let json = serde_json::to_string_pretty(&file)?;
-        fs::write(&self.path, &json)?;
-        crate::hsm::platform::restrict_to_owner(&self.path)
-            .map_err(|e| anyhow::anyhow!("failed to restrict vault file permissions: {e}"))?;
+        // Atomic + owner-only from creation: a crash mid-save must not be
+        // able to truncate the only copy of every secret you own, and the
+        // file must never exist readable-by-others even for an instant.
+        crate::hsm::platform::write_private(&self.path, json.as_bytes())
+            .map_err(|e| anyhow::anyhow!("failed to write vault file: {e}"))?;
 
         Ok(())
     }
@@ -444,7 +457,10 @@ impl VaultStore {
     /// existing data key with it. Returns the mnemonic — the caller must
     /// display it to the user; it is never stored in the clear and cannot
     /// be recovered later.
-    pub fn generate_recovery_key(&mut self) -> anyhow::Result<String> {
+    /// Returns the phrase in a `Zeroizing<String>`: it is a second, complete
+    /// key to the vault, and the caller only needs it long enough to show it
+    /// to a human once.
+    pub fn generate_recovery_key(&mut self) -> anyhow::Result<Zeroizing<String>> {
         let mut entropy: [u8; 32] = crypto::random_bytes();
         let mnemonic = bip39::Mnemonic::from_entropy(&entropy)
             .map_err(|e| anyhow::anyhow!("mnemonic generation failed: {e}"))?;
@@ -463,7 +479,7 @@ impl VaultStore {
             blob: B64.encode(blob),
         });
 
-        Ok(phrase)
+        Ok(Zeroizing::new(phrase))
     }
 
     /// Rewrap the data key under a new passphrase. Entries are never
@@ -584,7 +600,10 @@ pub fn migrate_v1_to_v2(path: &Path, passphrase: &str) -> anyhow::Result<()> {
         let plaintext = crypto::decrypt_aes256gcm(&old_enc_key, &ct_bytes, b"").map_err(|_| {
             anyhow::anyhow!("wrong passphrase — failed to decrypt entry '{name}' during migration")
         })?;
-        let value = String::from_utf8(plaintext)
+        // to_vec copies out of the Zeroizing buffer; the original is still
+        // wiped on drop, and `value` lands in BodyEntry, which is zeroized
+        // when the store is dropped.
+        let value = String::from_utf8(plaintext.to_vec())
             .map_err(|err| anyhow::anyhow!("entry '{name}' is not valid UTF-8: {err}"))?;
         entries.insert(
             name.clone(),
@@ -901,7 +920,7 @@ mod tests {
         let corrupted = words.join(" ");
         let parsed = bip39::Mnemonic::parse_normalized(&corrupted);
         assert!(
-            parsed.is_err() || parsed.unwrap().to_string() != mnemonic,
+            parsed.is_err() || parsed.unwrap().to_string() != *mnemonic,
             "corrupted phrase must not parse to the same mnemonic"
         );
     }
