@@ -23,6 +23,10 @@ statement, no code sample, no commit.
 | Find secrets scattered in the repo | `hearth-vault scan [path]` (redacted output, safe to run) | Grep for likely key patterns yourself and print matches |
 | Read a project's key prefix | `cat .hearth-vault` or `hearth-vault project-prefix` (plain string, not a secret) | Guess the prefix or hardcode one |
 | Write code consuming a vault-injected var | `os.environ["X"]` / `process.env.X` / `std::env::var("X")` read once at startup, never logged | Print/log the value anywhere, including in error paths |
+| Rotate a credential | Tell the human to run `hearth-vault set <key>` (the due date advances by itself); check what is due with `hearth-vault list --due` | Retier a key so you can read the old value "to compare" |
+| Give a teammate a credential | `hearth-vault share --prefix <p> --to <their-identity> --output bundle.hvs` | Paste a value into a message, a ticket, or a PR |
+| Accept a shared bundle | `hearth-vault receive bundle.hvs --dry-run`, then without the flag | Open the bundle file to "check" what is in it |
+| Commands feel slow / keep prompting | Tell the human to run `hearth-vault agent --daemon && hearth-vault unlock` | `export HEARTH_VAULT_PASSPHRASE=...` in your shell |
 
 ## Commands
 
@@ -44,7 +48,22 @@ hearth-vault import-env .env --prefix myapp/
 
 # Scan for secrets by shape (redacted report, exit 1 if it finds something)
 hearth-vault scan
+hearth-vault scan --staged        # just what is staged for commit
+
+# Rotation state (metadata only)
+hearth-vault list --due           # overdue; exit 1 if anything is listed
+hearth-vault list --due 7         # due within a week
+hearth-vault list --json          # machine-readable metadata, never values
+
+# Sharing (values are encrypted to the recipient; you never see one)
+hearth-vault identity                                    # your public identity
+hearth-vault share --prefix myapp/ --to <identity> --output bundle.hvs
+hearth-vault receive bundle.hvs --dry-run                # names + tiers only
 ```
+
+`--prefix` is optional for `exec` when the project has a `.hearth-vault`
+marker or `HEARTH_VAULT_PREFIX` is set — prefer bare `hearth-vault exec --
+<cmd>` over guessing a prefix.
 
 Env var name mapping used by both `exec` and `export-env-file`: strip the
 prefix, uppercase, `/` and `-` -> `_`. `myapp/database-url` under prefix
@@ -67,11 +86,31 @@ prefix, uppercase, `/` and `-` -> `_`. `myapp/database-url` under prefix
   human-controlled CI/systemd use, not for an agent to self-authorize around
   the refusal.
 - `hearth-vault prompt` — prints the vault passphrase.
+- `export HEARTH_VAULT_PASSPHRASE=...` to stop being prompted. If commands
+  are prompting, ask the human to start the unlock agent
+  (`hearth-vault agent --daemon`, then `hearth-vault unlock`) — never park
+  the passphrase in an environment your processes inherit.
+- Opening a `.hvs` bundle file, or any backup/snapshot, to inspect it. Use
+  `hearth-vault receive <file> --dry-run`, which reports names and tiers
+  only.
 - Reading `vault.json` or any exported-secret file directly.
 - `export FOO=$(hearth-vault ...)` in your own shell, or any pattern that
   would put a secret into a variable you might subsequently echo or forward.
 - Writing a secret literal into source, a config file, a log line, or a
   commit — including "example" values copied from a real one.
+
+## Rotation
+
+Rotating is just storing a new value: `hearth-vault set <key>` keeps the
+key's tier and advances its due date automatically. There is no separate
+"mark rotated" command, and you should not invent one.
+
+- Check what needs attention: `hearth-vault list --due` (exit 1 = something
+  is due). Safe for you to run; it prints names and dates, never values.
+- The human runs the `set` — you never see or supply the new value.
+- **A vault-side rotation is not a rotation.** If the old value leaked, it
+  stays live at the provider until someone revokes it there. Say so
+  explicitly rather than reporting the rotation as complete.
 
 ## Leak response procedure
 

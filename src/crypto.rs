@@ -193,6 +193,26 @@ pub fn derive_subkey(
     Ok(subkey)
 }
 
+/// Derive a key from non-uniform input keying material (an ECDH shared
+/// secret) with an explicit salt.
+///
+/// Separate from [`derive_subkey`] because the inputs differ in kind: that
+/// one expands an already-uniform 256-bit key, this one *extracts* from a
+/// curve point, which is uniform-ish but not uniform, and binds a salt.
+/// Sharing binds both public keys in as the salt so a bundle cannot be
+/// replayed against a different recipient.
+pub fn derive_shared_key(
+    ikm: &[u8],
+    salt: &[u8],
+    context: &str,
+) -> Result<[u8; KEY_SIZE], CryptoError> {
+    let hkdf = Hkdf::<Sha3_256>::new(Some(salt), ikm);
+    let mut key = [0u8; KEY_SIZE];
+    hkdf.expand(context.as_bytes(), &mut key)
+        .map_err(|e| CryptoError::KeyDerivation(e.to_string()))?;
+    Ok(key)
+}
+
 // ── BLAKE3 Hashing ─────────────────────────────────────────────────────────
 
 /// Hash data with BLAKE3 (256-bit).

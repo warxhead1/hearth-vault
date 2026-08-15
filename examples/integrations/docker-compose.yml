@@ -1,0 +1,45 @@
+# A Compose stack whose secrets come from the vault instead of a .env file.
+#
+# Run it as:
+#     hearth-vault exec --prefix myapp/ -- docker compose up
+#
+# How this works: Compose interpolates ${VAR} from ITS OWN environment, which
+# is the one hearth-vault just injected. So the values reach the containers
+# without ever existing in a file on your disk.
+#
+# Note the `${VAR:?...}` form throughout. It makes Compose fail loudly if a
+# variable is missing, instead of quietly starting Postgres with an empty
+# password -- which is the actual failure mode of the .env approach this
+# replaces.
+#
+# What NOT to do:
+#   env_file: .env        <- the thing you are migrating away from
+#   POSTGRES_PASSWORD: hunter2   <- a literal in a file you will commit
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${DB_USER:?run via `hearth-vault exec --prefix myapp/`}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?run via `hearth-vault exec --prefix myapp/`}
+      POSTGRES_DB: myapp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${DB_USER}:${DB_PASSWORD}@db:5432/myapp
+      STRIPE_API_KEY: ${STRIPE_API_KEY:?missing from the vault}
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:

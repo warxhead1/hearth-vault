@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use hearth_vault::hsm::platform;
-use hearth_vault::{SensitiveString, TIER_SIGN_ONLY, TIER_USE_ONLY, VaultStore};
-use zeroize::Zeroize;
+use hearth_vault::{RotationState, SensitiveString, TIER_SIGN_ONLY, TIER_USE_ONLY, VaultStore};
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +55,24 @@ enum Commands {
         /// name cannot silently change who is allowed to read it.
         #[arg(short, long)]
         tier: Option<u8>,
+        /// Rotation policy: remind me to replace this every N days. Stored
+        /// with the key, so every later `set` of the same name pushes the
+        /// due date forward automatically — rotating IS storing a new value,
+        /// there is no separate "mark rotated" step to forget. `--rotate-days
+        /// 0` clears an existing policy.
+        #[arg(long, value_name = "N")]
+        rotate_days: Option<u32>,
+        /// Pin an exact due date instead of a recurring policy, for
+        /// credentials whose lifetime the provider dictates (a 90-day cloud
+        /// token). Accepts RFC3339 (`2026-12-01T00:00:00Z`) or a relative
+        /// `30d` / `12w`. A negative offset (`-7d`) marks something already
+        /// overdue, which is how you flag a credential you know is stale
+        /// while you queue up the rotation.
+        ///
+        /// `allow_hyphen_values` is what lets `-7d` through: without it clap
+        /// reads the leading `-` as the start of another flag.
+        #[arg(long, value_name = "WHEN", allow_hyphen_values = true)]
+        expires: Option<String>,
     },
     /// Import a single credential from a file (for browser-automation
     /// handoff, or piping a generated key straight in).
@@ -100,11 +118,31 @@ enum Commands {
     /// data directory in the current v2 on-disk format.
     Migrate,
     /// List all stored credential keys (never shows values)
-    List,
+    List {
+        /// Machine-readable output, for scripts and dashboards. Metadata
+        /// only — there is no flag anywhere that makes `list` emit values.
+        #[arg(long)]
+        json: bool,
+        /// Show only credentials that are overdue for rotation, or due
+        /// within N days. Exits 1 if any are listed, so it drops straight
+        /// into a cron job or a CI step.
+        #[arg(long, value_name = "DAYS", num_args = 0..=1, default_missing_value = "0")]
+        due: Option<i64>,
+    },
     /// Check if a credential exists
     Has { key: String },
-    /// Delete a credential
-    Delete { key: String },
+    /// Delete a credential.
+    ///
+    /// Takes an encrypted snapshot of the whole vault first (see `backup`),
+    /// because the recovery mnemonic restores the vault *key*, not entries
+    /// you removed — without a snapshot, one mistyped key name is
+    /// unrecoverable.
+    Delete {
+        key: String,
+        /// Skip the automatic pre-delete snapshot.
+        #[arg(long)]
+        no_backup: bool,
+    },
     /// Rename (move) a credential to a new key name.
     /// Example: hearth-vault rename GITHUB_TOKEN auth/GITHUB_TOKEN
     Rename { from: String, to: String },
@@ -138,8 +176,12 @@ enum Commands {
     },
     /// Initialize the vault (first-time setup)
     Init,
-    /// Show vault status (backend type, path, permissions)
-    Status,
+    /// Show vault status (backend type, path, permissions, rotations due)
+    Status {
+        /// Machine-readable output for monitoring.
+        #[arg(long)]
+        json: bool,
+    },
     /// Recover vault access using your 24-word recovery mnemonic. Also
     /// rotates the recovery key, since the old one was just used/entered.
     Recover,
@@ -192,9 +234,15 @@ enum Commands {
     /// Example:
     ///   hearth-vault exec --prefix myapp/ -- ./start-server --port 8080
     Exec {
-        /// Inject keys starting with this prefix (e.g. "myapp/")
+        /// Inject keys starting with this prefix (e.g. "myapp/").
+        ///
+        /// Optional: when omitted, falls back to $HEARTH_VAULT_PREFIX (what
+        /// the direnv integration sets), then to the nearest `.hearth-vault`
+        /// marker file walking up from the current directory. In a project
+        /// with a marker, `hearth-vault exec -- npm run dev` just works —
+        /// and an agent does not have to guess or hardcode a prefix.
         #[arg(short, long)]
-        prefix: String,
+        prefix: Option<String>,
         /// Command and arguments to run (everything after `--`)
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -305,6 +353,142 @@ enum Commands {
         rules: bool,
         /// Overwrite a vault key that already exists (only meaningful with
         /// --adopt)
+        #[arg(long)]
+        force: bool,
+        /// Scan only the files staged in git (`git diff --cached`). This is
+        /// what the installed pre-commit hook runs: it checks exactly what
+        /// you are about to commit, in the second before it becomes history.
+        #[arg(long)]
+        staged: bool,
+    },
+    /// Install hearth-vault's secret scan as a git pre-commit hook in this
+    /// repository, so a key can't reach history by accident.
+    ///
+    /// A secret caught here costs you ten seconds. The same secret caught
+    /// after a push costs you a rotation, a force-push that does not really
+    /// erase it, and a conversation with whoever mirrors your repo.
+    InstallHook {
+        /// Repository root (default: current directory)
+        path: Option<String>,
+        /// Overwrite an existing pre-commit hook (it is backed up first)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print a `direnv` integration snippet for `~/.config/direnv/direnvrc`.
+    ///
+    /// Note what it does and does not do: entering a project directory
+    /// exports HEARTH_VAULT_PREFIX (a *name*, not a secret) so bare
+    /// `hearth-vault exec -- <cmd>` works there. It deliberately does not
+    /// export your secrets into the interactive shell — that would undo the
+    /// entire point of the tool, and direnv makes it far too easy to do by
+    /// accident.
+    DirenvInit,
+    /// Run a short-lived unlock cache so repeated commands don't each pay
+    /// the ~120ms Argon2id derivation.
+    ///
+    /// This replaces `export HEARTH_VAULT_PASSPHRASE=$(hearth-vault prompt)`,
+    /// which put your passphrase into an environment variable that every
+    /// child process — including coding agents — inherits. The agent holds a
+    /// derived wrap key instead, for a bounded time, in a process only you
+    /// can talk to.
+    ///
+    /// Example: hearth-vault agent --daemon && hearth-vault unlock
+    Agent {
+        /// How long a cached key survives, in seconds.
+        #[arg(long, default_value_t = 900)]
+        ttl: u64,
+        /// Fork into the background instead of running in the foreground.
+        #[arg(long)]
+        daemon: bool,
+        /// Forget every cached key, leaving the agent running.
+        #[arg(long)]
+        drop: bool,
+        /// Shut the agent down.
+        #[arg(long)]
+        stop: bool,
+        /// Report whether an agent is running and how many keys it holds.
+        #[arg(long)]
+        status: bool,
+    },
+    /// Prompt for the passphrase once and hand the derived key to a running
+    /// agent. Every later command against this vault is then instant until
+    /// the agent's TTL expires.
+    Unlock,
+    /// Forget every key cached by the agent, right now. The panic button,
+    /// and what you run when you step away from the machine.
+    Lock,
+    /// Write an encrypted snapshot of the vault.
+    ///
+    /// No passphrase needed: the vault file is already encrypted at rest, so
+    /// a backup is a copy, and a copy you cannot make without unlocking is a
+    /// copy you will not make. Restoring, of course, still needs the
+    /// passphrase (or the recovery mnemonic) that the snapshot was made
+    /// under — a backup taken before a `change-passphrase` opens with the
+    /// OLD one.
+    Backup {
+        /// Destination directory or file (default: alongside the vault)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Replace the current vault with a snapshot.
+    ///
+    /// The snapshot is verified to open with the passphrase you supply
+    /// BEFORE anything is overwritten, and the vault being replaced is
+    /// itself backed up first. A restore that leaves you with neither vault
+    /// is the one outcome this must never produce.
+    Restore {
+        /// Snapshot file to restore from
+        file: String,
+    },
+    /// Print this vault's public sharing identity — the string a teammate
+    /// needs to send you credentials. Not a secret; paste it anywhere.
+    ///
+    /// The matching private key is derived from your data key and is never
+    /// stored, so there is nothing extra to back up and a restored vault
+    /// keeps the same identity.
+    Identity,
+    /// Seal credentials to a teammate's identity, producing a bundle file
+    /// that only they can open. Safe to send over Slack, email, or a PR.
+    ///
+    /// Confirm their fingerprint out of band first: a bundle proves only
+    /// that its maker knew the recipient's public key, not who made it.
+    ///
+    /// Example: hearth-vault share --prefix myapp/ --to hv1pubAbC... --output staging.hvs
+    Share {
+        /// Share every key under this prefix
+        #[arg(short, long)]
+        prefix: String,
+        /// Recipient's identity string (from their `hearth-vault identity`)
+        #[arg(long)]
+        to: String,
+        /// Bundle file to write (default: stdout is NOT used — a path is
+        /// required, because a bundle is a file you send, not something to
+        /// paste through a terminal)
+        #[arg(short, long)]
+        output: String,
+        /// Floor the recipient's tier at this value: `--max-tier 4` shares a
+        /// signing key they can `sign` with but never inject or print. Tier
+        /// is only ever made stricter, never looser.
+        #[arg(long)]
+        max_tier: Option<u8>,
+        /// A note for the recipient (shown by `receive --dry-run`). Never
+        /// put a credential in here.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Open a bundle a teammate shared with you and store its entries in
+    /// your own vault.
+    Receive {
+        /// Bundle file to open
+        file: String,
+        /// Show what the bundle contains (key names and tiers, never
+        /// values) without storing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Store the entries under a different prefix than the sender used.
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Overwrite keys that already exist in your vault
         #[arg(long)]
         force: bool,
     },
@@ -537,14 +721,49 @@ fn open_vault(vault_path: PathBuf, backend_name: Option<&str>) -> anyhow::Result
         }
     }
 
-    if let Ok(passphrase) = std::env::var("HEARTH_VAULT_PASSPHRASE") {
-        if !passphrase.is_empty() {
-            return VaultStore::open_at_with_passphrase(vault_path, &passphrase);
+    // A running agent can supply the derived wrap key, skipping Argon2id.
+    // A stale key (the vault was re-salted by `change-passphrase` since it
+    // was cached) must not be fatal — fall through to the passphrase, which
+    // is what a user who just changed it expects to be asked for.
+    #[cfg(unix)]
+    if let Some(key) = hearth_vault::agent::try_get(&vault_path) {
+        match VaultStore::open_at_with_wrap_key(vault_path.clone(), &key) {
+            Ok(store) => {
+                note!("Vault unlocked via agent (no passphrase needed).");
+                return Ok(store);
+            }
+            Err(_) => note!("Agent's cached key is stale for this vault; asking for passphrase."),
         }
     }
 
-    let passphrase = rpassword::prompt_password("Vault passphrase: ")?;
-    VaultStore::open_at_with_passphrase(vault_path, &passphrase)
+    let (passphrase, from_prompt) = match std::env::var("HEARTH_VAULT_PASSPHRASE") {
+        Ok(p) if !p.is_empty() => (Zeroizing::new(p), false),
+        _ => (
+            Zeroizing::new(rpassword::prompt_password("Vault passphrase: ")?),
+            true,
+        ),
+    };
+    let store = VaultStore::open_at_with_passphrase(vault_path.clone(), &passphrase)?;
+
+    // Having just paid for the derivation and proven the passphrase correct,
+    // hand the result to an agent if one is listening. This deliberately
+    // covers the env-var path too, so anyone still using the old
+    // `HEARTH_VAULT_PASSPHRASE` pattern gets the speedup without changing
+    // anything — and has one less reason to keep the passphrase in their
+    // environment. Silent and best-effort: running without an agent is
+    // normal, and this must never be why a command fails.
+    #[cfg(unix)]
+    if hearth_vault::agent::is_running()
+        && let Ok(key) = VaultStore::derive_wrap_key(&vault_path, &passphrase)
+        && hearth_vault::agent::try_put(&vault_path, &key)
+        && from_prompt
+    {
+        note!("Cached in the agent — subsequent commands will not prompt.");
+    }
+    #[cfg(not(unix))]
+    let _ = from_prompt;
+
+    Ok(store)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -558,7 +777,12 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Init => cmd_init(vault_path)?,
-        Commands::Set { keys, tier } => cmd_set(vault_path, backend, &keys, tier)?,
+        Commands::Set {
+            keys,
+            tier,
+            rotate_days,
+            expires,
+        } => cmd_set(vault_path, backend, &keys, tier, rotate_days, expires)?,
         Commands::Import { file, key, tier } => cmd_import(vault_path, backend, &file, &key, tier)?,
         Commands::ImportEnv {
             file,
@@ -568,15 +792,15 @@ fn main() -> anyhow::Result<()> {
             force,
         } => cmd_import_env(vault_path, backend, file, prefix, tier, keep, force)?,
         Commands::Migrate => cmd_migrate()?,
-        Commands::List => cmd_list(vault_path, backend)?,
+        Commands::List { json, due } => cmd_list(vault_path, backend, json, due)?,
         Commands::Has { key } => cmd_has(vault_path, backend, &key)?,
-        Commands::Delete { key } => cmd_delete(vault_path, backend, &key)?,
+        Commands::Delete { key, no_backup } => cmd_delete(vault_path, backend, &key, no_backup)?,
         Commands::Rename { from, to } => cmd_rename(vault_path, backend, &from, &to)?,
         Commands::Retier { key, tier } => cmd_retier(vault_path, backend, &key, tier)?,
         Commands::ExportEnv { key, env_name } => {
             cmd_export_env(vault_path, backend, &key, &env_name)?
         }
-        Commands::Status => cmd_status(vault_path, backend)?,
+        Commands::Status { json } => cmd_status(vault_path, backend, json)?,
         Commands::Recover => cmd_recover(vault_path)?,
         Commands::ChangePassphrase => cmd_change_passphrase(vault_path, backend)?,
         Commands::NewRecoveryKey => cmd_new_recovery_key(vault_path)?,
@@ -585,7 +809,7 @@ fn main() -> anyhow::Result<()> {
         Commands::ExportEnvFile { prefix, output } => {
             cmd_export_env_file(vault_path, backend, &prefix, &output)?
         }
-        Commands::Exec { prefix, command } => cmd_exec(vault_path, backend, &prefix, &command)?,
+        Commands::Exec { prefix, command } => cmd_exec(vault_path, backend, prefix, &command)?,
         Commands::Sign {
             key,
             algorithm,
@@ -604,9 +828,39 @@ fn main() -> anyhow::Result<()> {
             prefix,
             rules,
             force,
-        } => cmd_scan(vault_path, backend, path, json, adopt, prefix, rules, force)?,
+            staged,
+        } => cmd_scan(
+            vault_path, backend, path, json, adopt, prefix, rules, force, staged,
+        )?,
         Commands::ShellInit { shell } => cmd_shell_init(shell),
         Commands::ProjectPrefix => cmd_project_prefix()?,
+        Commands::InstallHook { path, force } => cmd_install_hook(path, force)?,
+        Commands::DirenvInit => cmd_direnv_init(),
+        Commands::Agent {
+            ttl,
+            daemon,
+            drop,
+            stop,
+            status,
+        } => cmd_agent(ttl, daemon, drop, stop, status)?,
+        Commands::Unlock => cmd_unlock(vault_path)?,
+        Commands::Lock => cmd_lock()?,
+        Commands::Backup { output } => cmd_backup(vault_path, output)?,
+        Commands::Restore { file } => cmd_restore(vault_path, &file)?,
+        Commands::Identity => cmd_identity(vault_path, backend)?,
+        Commands::Share {
+            prefix,
+            to,
+            output,
+            max_tier,
+            note,
+        } => cmd_share(vault_path, backend, &prefix, &to, &output, max_tier, note)?,
+        Commands::Receive {
+            file,
+            dry_run,
+            prefix,
+            force,
+        } => cmd_receive(vault_path, backend, &file, dry_run, prefix, force)?,
     }
 
     Ok(())
@@ -681,10 +935,15 @@ fn cmd_set(
     backend: Option<&str>,
     keys: &[String],
     tier: Option<u8>,
+    rotate_days: Option<u32>,
+    expires: Option<String>,
 ) -> anyhow::Result<()> {
     if keys.is_empty() {
         anyhow::bail!("provide at least one key name");
     }
+    // Parsed before the prompt, not after: discovering that "30dd" is not a
+    // duration should not cost you the retyping of a secret.
+    let explicit_expiry = expires.as_deref().map(parse_when).transpose()?;
 
     // Single unlock for all keys
     let mut store = open_vault(vault_path, backend)?;
@@ -720,12 +979,30 @@ fn cmd_set(
         let sensitive = SensitiveString::new(value.clone());
         value.zeroize();
         store.set(key, &sensitive, key_tier)?;
+
+        // Order matters: `set` recomputes the due date from any EXISTING
+        // policy, so a new policy must be applied after it, and an explicit
+        // --expires after that, since it is the more specific instruction.
+        if let Some(days) = rotate_days {
+            // `--rotate-days 0` is how you clear a policy; a due date zero
+            // days out would otherwise mean "overdue immediately".
+            store.set_rotation(key, if days == 0 { None } else { Some(days) })?;
+        }
+        if let Some(ref when) = explicit_expiry {
+            store.set_expiry(key, Some(when.clone()))?;
+        }
+
         eprintln!("  \u{2713} {key} (tier {key_tier})");
         stored_tiers.push(key_tier);
     }
 
     store.save()?;
     eprintln!("Stored {} credential(s).", keys.len());
+    for entry in store.list().iter().filter(|e| keys.contains(&e.key)) {
+        if let Some(ref due) = entry.expires_at {
+            eprintln!("  {} next due {}", entry.key, friendly_date(due));
+        }
+    }
     if stored_tiers.contains(&TIER_USE_ONLY) {
         eprintln!(
             "Tier {TIER_USE_ONLY} is use-only: never printed by export-env / export-env-file. \
@@ -964,25 +1241,120 @@ fn cmd_migrate() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_list(vault_path: PathBuf, backend: Option<&str>) -> anyhow::Result<()> {
+fn cmd_list(
+    vault_path: PathBuf,
+    backend: Option<&str>,
+    json: bool,
+    due: Option<i64>,
+) -> anyhow::Result<()> {
     let store = open_vault(vault_path, backend)?;
-    let entries = store.list();
+    let mut entries = store.list();
 
-    if entries.is_empty() {
-        eprintln!("Vault is empty. Use 'hearth-vault set <key>' to add credentials.");
+    // `--due N` means "overdue, or coming due within N days". `--due` with
+    // no number means overdue only.
+    if let Some(window) = due {
+        entries.retain(|e| match e.rotation_state() {
+            RotationState::Overdue { .. } => true,
+            RotationState::Ok { days_left } => days_left <= window,
+            RotationState::NoPolicy => false,
+        });
+    }
+
+    if json {
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "key": e.key,
+                    "tier": e.tier,
+                    "created_at": e.created_at,
+                    "updated_at": e.updated_at,
+                    "rotate_days": e.rotate_days,
+                    "expires_at": e.expires_at,
+                    "rotation": rotation_word(e),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else if entries.is_empty() {
+        if due.is_some() {
+            eprintln!("Nothing due for rotation.");
+        } else {
+            eprintln!("Vault is empty. Use 'hearth-vault set <key>' to add credentials.");
+        }
         return Ok(());
+    } else {
+        // Dates, not full RFC3339: nanosecond timestamps are 32 characters
+        // wide, which blew past the column and left the table ragged. Full
+        // precision is still one `--json` away.
+        println!(
+            "{:<38} {:>4}  {:<12} {:<12} ROTATION",
+            "KEY", "TIER", "CREATED", "UPDATED"
+        );
+        println!("{}", "-".repeat(88));
+        for entry in &entries {
+            println!(
+                "{:<38} {:>4}  {:<12} {:<12} {}",
+                entry.key,
+                entry.tier,
+                friendly_date(&entry.created_at),
+                friendly_date(&entry.updated_at),
+                rotation_word(entry)
+            );
+        }
+        eprintln!("\n{} credential(s) stored.", entries.len());
     }
 
-    println!("{:<35} {:>4}  {:<25} UPDATED", "KEY", "TIER", "CREATED");
-    println!("{}", "-".repeat(90));
-    for entry in &entries {
-        println!(
-            "{:<35} {:>4}  {:<25} {}",
-            entry.key, entry.tier, entry.created_at, entry.updated_at
-        );
+    // Non-zero when anything is due, so `hearth-vault list --due 7` is a
+    // usable cron/CI check without parsing output.
+    if due.is_some() && !entries.is_empty() {
+        std::process::exit(1);
     }
-    eprintln!("\n{} credential(s) stored.", entries.len());
     Ok(())
+}
+
+/// One-word rotation status for the `list` table and `--json`.
+fn rotation_word(entry: &hearth_vault::VaultEntry) -> String {
+    match entry.rotation_state() {
+        RotationState::NoPolicy => "-".to_string(),
+        RotationState::Overdue { days_over: 0 } => "DUE TODAY".to_string(),
+        RotationState::Overdue { days_over } => format!("OVERDUE {days_over}d"),
+        RotationState::Ok { days_left } => format!("due in {days_left}d"),
+    }
+}
+
+/// Render an RFC3339 timestamp as a plain date. Rotation cadences are
+/// measured in days; the seconds are noise in this context.
+fn friendly_date(rfc3339: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|_| rfc3339.to_string())
+}
+
+/// Accept either an absolute RFC3339 instant or a relative `30d` / `12w` /
+/// `6m` offset, because both are natural ways to say when a credential dies:
+/// a provider gives you a date, a hygiene rule gives you a duration.
+fn parse_when(input: &str) -> anyhow::Result<String> {
+    let input = input.trim();
+    if let Ok(absolute) = chrono::DateTime::parse_from_rfc3339(input) {
+        return Ok(absolute.to_rfc3339());
+    }
+    if let Some(rest) = input.strip_suffix(['d', 'w', 'm', 'y']) {
+        let n: i64 = rest.parse().map_err(|_| {
+            anyhow::anyhow!("could not read '{input}' as a duration (try 30d, 12w, 6m, 1y)")
+        })?;
+        let days = match input.chars().last().expect("checked non-empty by strip") {
+            'd' => n,
+            'w' => n * 7,
+            'm' => n * 30,
+            _ => n * 365,
+        };
+        return Ok((chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339());
+    }
+    anyhow::bail!(
+        "could not read '{input}' as a date — use RFC3339 (2026-12-01T00:00:00Z) \
+         or a relative offset (30d, 12w, 6m, 1y)"
+    )
 }
 
 fn cmd_has(vault_path: PathBuf, backend: Option<&str>, key: &str) -> anyhow::Result<()> {
@@ -996,15 +1368,30 @@ fn cmd_has(vault_path: PathBuf, backend: Option<&str>, key: &str) -> anyhow::Res
     Ok(())
 }
 
-fn cmd_delete(vault_path: PathBuf, backend: Option<&str>, key: &str) -> anyhow::Result<()> {
-    let mut store = open_vault(vault_path, backend)?;
-    if store.delete(key)? {
-        store.save()?;
-        eprintln!("Deleted: {key}");
-    } else {
+fn cmd_delete(
+    vault_path: PathBuf,
+    backend: Option<&str>,
+    key: &str,
+    no_backup: bool,
+) -> anyhow::Result<()> {
+    let mut store = open_vault(vault_path.clone(), backend)?;
+    if !store.has(key) {
         eprintln!("Key not found: {key}");
         std::process::exit(1);
     }
+
+    // Snapshot before the removal, not after — and only once we know the key
+    // exists, so a typo'd name does not litter the disk with snapshots.
+    if !no_backup {
+        match write_backup(&vault_path, None) {
+            Ok(dest) => eprintln!("Snapshot before delete: {}", dest.display()),
+            Err(e) => eprintln!("warning: could not snapshot before delete: {e}"),
+        }
+    }
+
+    store.delete(key)?;
+    store.save()?;
+    eprintln!("Deleted: {key}");
     Ok(())
 }
 
@@ -1425,12 +1812,15 @@ fn collect_exec_env(store: &VaultStore, prefix: &str) -> anyhow::Result<ExecEnv>
 fn cmd_exec(
     vault_path: PathBuf,
     backend: Option<&str>,
-    prefix: &str,
+    prefix: Option<String>,
     command: &[String],
 ) -> anyhow::Result<()> {
     let (program, args) = command
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("no command given after `--`"))?;
+
+    let prefix = resolve_prefix(prefix)?;
+    let prefix = prefix.as_str();
 
     let store = open_vault(vault_path, backend)?;
     let (injected, skipped_use_only) = collect_exec_env(&store, prefix)?;
@@ -1763,7 +2153,10 @@ fn sign_with_key(
     result
 }
 
-fn cmd_status(vault_path: PathBuf, backend: Option<&str>) -> anyhow::Result<()> {
+fn cmd_status(vault_path: PathBuf, backend: Option<&str>, json: bool) -> anyhow::Result<()> {
+    if json {
+        return status_json(vault_path, backend);
+    }
     match resolve_backend(backend) {
         Ok(hsm) => println!("HSM backend: {} (tier {})", hsm.name(), hsm.tier()),
         Err(e) => println!(
@@ -1800,7 +2193,116 @@ fn cmd_status(vault_path: PathBuf, backend: Option<&str>) -> anyhow::Result<()> 
         }
     }
 
+    #[cfg(unix)]
+    match hearth_vault::agent::control("STATUS") {
+        Ok(reply) => println!(
+            "Agent: running at {} ({})",
+            hearth_vault::agent::socket_path().display(),
+            reply.trim_start_matches("OK ")
+        ),
+        Err(_) => println!("Agent: not running (`hearth-vault agent --daemon` to start one)"),
+    }
+
+    // Rotation state lives inside the encrypted body, so reporting it means
+    // unlocking. `status` must stay usable without a passphrase — it is the
+    // command you run when something is wrong — so this reports only when an
+    // unlock is already available, and points elsewhere when it is not.
+    match try_open_quietly(&vault_path, backend) {
+        Some(store) => {
+            let entries = store.list();
+            let overdue = entries
+                .iter()
+                .filter(|e| matches!(e.rotation_state(), RotationState::Overdue { .. }))
+                .count();
+            let soon = entries
+                .iter()
+                .filter(|e| matches!(e.rotation_state(), RotationState::Ok { days_left } if days_left <= 7))
+                .count();
+            let tracked = entries.iter().filter(|e| e.rotate_days.is_some()).count();
+            println!(
+                "Rotation: {tracked} of {} key(s) have a policy",
+                entries.len()
+            );
+            if overdue > 0 {
+                println!("  {overdue} OVERDUE — run `hearth-vault list --due`");
+            }
+            if soon > 0 {
+                println!("  {soon} due within 7 days");
+            }
+        }
+        None => println!("Rotation: locked (run `hearth-vault list --due` to check)"),
+    }
+
     Ok(())
+}
+
+/// Open the vault only if it can be done without prompting a human — via a
+/// running agent, a sealed passphrase, or `HEARTH_VAULT_PASSPHRASE`. Used by
+/// `status`, which must never block on a prompt.
+fn try_open_quietly(vault_path: &Path, backend: Option<&str>) -> Option<VaultStore> {
+    #[cfg(unix)]
+    if let Some(key) = hearth_vault::agent::try_get(vault_path)
+        && let Ok(store) = VaultStore::open_at_with_wrap_key(vault_path.to_path_buf(), &key)
+    {
+        return Some(store);
+    }
+    if let Ok(passphrase) = std::env::var("HEARTH_VAULT_PASSPHRASE")
+        && !passphrase.is_empty()
+        && let Ok(store) =
+            VaultStore::open_at_with_passphrase(vault_path.to_path_buf(), &passphrase)
+    {
+        return Some(store);
+    }
+    // The sealed-passphrase path, if a hardware backend is holding one.
+    let sealed = sealed_passphrase_path(vault_path);
+    if sealed.exists()
+        && let Ok(hsm) = resolve_backend(backend)
+        && hsm.tier() <= 2
+        && let Ok(blob) = fs::read(&sealed)
+        && let Ok(bytes) = hsm.unseal(&blob, "hearth-vault")
+        && let Ok(passphrase) = std::str::from_utf8(&bytes)
+        && let Ok(store) = VaultStore::open_at_with_passphrase(vault_path.to_path_buf(), passphrase)
+    {
+        return Some(store);
+    }
+    None
+}
+
+fn status_json(vault_path: PathBuf, backend: Option<&str>) -> anyhow::Result<()> {
+    let rotation = try_open_quietly(&vault_path, backend).map(|store| {
+        let entries = store.list();
+        serde_json::json!({
+            "tracked": entries.iter().filter(|e| e.rotate_days.is_some()).count(),
+            "total": entries.len(),
+            "overdue": entries.iter()
+                .filter(|e| matches!(e.rotation_state(), RotationState::Overdue { .. }))
+                .map(|e| e.key.clone())
+                .collect::<Vec<_>>(),
+        })
+    });
+
+    let out = serde_json::json!({
+        "vault_path": vault_path.display().to_string(),
+        "initialized": vault_path.exists(),
+        "backend": resolve_backend(backend).map(|h| h.name().to_string()).ok(),
+        "agent_running": agent_running(),
+        "rotation": rotation,
+    });
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+/// Whether an unlock agent is answering. Always false where the agent does
+/// not exist, so callers need no `cfg`.
+fn agent_running() -> bool {
+    #[cfg(unix)]
+    {
+        hearth_vault::agent::is_running()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 // ── scan / shell-init / project-prefix ──────────────────────────────────
@@ -1815,6 +2317,50 @@ fn is_dotenv_file(path: &Path) -> bool {
         Some(name) => name == ".env" || name.starts_with(".env.") || name.ends_with(".env"),
         None => false,
     }
+}
+
+/// The files git would include in the next commit: added, copied, modified,
+/// renamed — but not deleted, which have no content to scan.
+///
+/// `-z` and raw bytes rather than lines: a path may legally contain a
+/// newline, and a scanner that silently skipped such a file would be a
+/// wonderful place to hide a key.
+fn staged_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "diff",
+            "--cached",
+            "--name-only",
+            "--diff-filter=ACMR",
+            "-z",
+        ])
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run git: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git diff --cached failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    // Paths are relative to the repo root, which is not necessarily `root`.
+    let top = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run git: {e}"))?;
+    let base = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim().to_string());
+
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| base.join(String::from_utf8_lossy(s).into_owned()))
+        .filter(|p| p.is_file())
+        .collect())
 }
 
 fn print_rule_table() {
@@ -2034,6 +2580,7 @@ fn cmd_scan(
     prefix: Option<String>,
     rules: bool,
     force: bool,
+    staged: bool,
 ) -> anyhow::Result<()> {
     // `scan` never emits a usable secret — every value that reaches stdout
     // here is redacted first (see `hearth_vault::scan`'s module doc: at most
@@ -2047,11 +2594,26 @@ fn cmd_scan(
     }
 
     let root = PathBuf::from(path.unwrap_or_else(|| ".".to_string()));
-    if !root.exists() {
-        anyhow::bail!("path not found: {}", root.display());
-    }
 
-    let findings = hearth_vault::scan::scan_path(&root)?;
+    let findings = if staged {
+        if adopt {
+            anyhow::bail!(
+                "--staged and --adopt do not combine: adopting rewrites files, and rewriting \
+                 what is already staged would commit something you never reviewed"
+            );
+        }
+        let files = staged_files(&root)?;
+        if files.is_empty() {
+            eprintln!("Nothing staged.");
+            return Ok(());
+        }
+        hearth_vault::scan::scan_files(files)?
+    } else {
+        if !root.exists() {
+            anyhow::bail!("path not found: {}", root.display());
+        }
+        hearth_vault::scan::scan_path(&root)?
+    };
 
     if !adopt {
         if json {
@@ -2256,6 +2818,495 @@ fn cmd_project_prefix() -> anyhow::Result<()> {
 
     println!("{}", read_project_prefix(&marker)?);
     Ok(())
+}
+
+/// Work out which prefix `exec` should use.
+///
+/// Explicit flag, then `$HEARTH_VAULT_PREFIX` (set by the direnv
+/// integration), then the nearest `.hearth-vault` marker. The fallback chain
+/// is why `hearth-vault exec -- npm run dev` works with no arguments inside a
+/// configured project — and why an agent reading these docs does not have to
+/// guess a prefix or hardcode one that will be wrong in the next repo.
+fn resolve_prefix(explicit: Option<String>) -> anyhow::Result<String> {
+    if let Some(p) = explicit {
+        return Ok(p);
+    }
+    if let Ok(p) = std::env::var("HEARTH_VAULT_PREFIX")
+        && !p.is_empty()
+    {
+        return Ok(p);
+    }
+    if let Some(marker) = find_project_marker() {
+        return read_project_prefix(&marker);
+    }
+    anyhow::bail!(
+        "no prefix given and none discoverable \u{2014} pass --prefix <name>/, set \
+         $HEARTH_VAULT_PREFIX, or create a project marker: `echo \"<name>/\" > .hearth-vault`"
+    )
+}
+
+// ── backup / restore ────────────────────────────────────────────────────
+
+/// Read a passphrase, preferring `$HEARTH_VAULT_PASSPHRASE` when set.
+///
+/// `rpassword` opens the controlling terminal directly, so it fails outright
+/// with "no such device" under a pipe, in CI, or from a systemd unit. Every
+/// prompt a script might legitimately need to answer routes through here.
+fn read_passphrase(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
+    if let Ok(p) = std::env::var("HEARTH_VAULT_PASSPHRASE")
+        && !p.is_empty()
+    {
+        return Ok(Zeroizing::new(p));
+    }
+    Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
+}
+
+/// Copy the (already encrypted) vault file to a timestamped snapshot.
+///
+/// `dest` may be a directory or an explicit file path; `None` means "next to
+/// the vault". Returns where it landed.
+fn write_backup(vault_path: &Path, dest: Option<&Path>) -> anyhow::Result<PathBuf> {
+    if !vault_path.exists() {
+        anyhow::bail!("no vault at {} to back up", vault_path.display());
+    }
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    // Directory or file? An existing directory is unambiguous. For a path
+    // that does not exist yet, an extensionless one is taken as a directory
+    // to create: `--output ~/backups` on a machine where that folder does
+    // not exist yet should not silently produce a *file* called `backups`
+    // that the next backup then refuses to overwrite.
+    let target = match dest {
+        Some(p) if p.is_dir() || p.extension().is_none() => p.join(format!("vault-{stamp}.json")),
+        Some(p) => p.to_path_buf(),
+        None => vault_path.with_file_name(format!("vault-{stamp}.json")),
+    };
+    if target.exists() {
+        anyhow::bail!("refusing to overwrite existing file {}", target.display());
+    }
+
+    // Read-then-write-private rather than fs::copy: copy preserves the
+    // source mode on some platforms and not others, and a backup of a
+    // secrets file created world-readable for even an instant is a bug.
+    let contents = Zeroizing::new(fs::read(vault_path)?);
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    platform::write_private(&target, &contents)
+        .map_err(|e| anyhow::anyhow!("failed to write backup: {e}"))?;
+    Ok(target)
+}
+
+fn cmd_backup(vault_path: PathBuf, output: Option<String>) -> anyhow::Result<()> {
+    let dest = output.map(PathBuf::from);
+    let target = write_backup(&vault_path, dest.as_deref())?;
+    eprintln!("Backup written: {}", target.display());
+    eprintln!(
+        "It is encrypted with the passphrase in force at this moment \u{2014} store it anywhere, \
+         but remember that a later `change-passphrase` does NOT re-key this file."
+    );
+    Ok(())
+}
+
+fn cmd_restore(vault_path: PathBuf, file: &str) -> anyhow::Result<()> {
+    let source = PathBuf::from(file);
+    if !source.exists() {
+        anyhow::bail!("no such snapshot: {}", source.display());
+    }
+
+    // Prove the snapshot opens BEFORE touching the live vault. Restoring an
+    // unopenable file over a working vault would destroy both copies at
+    // once, which is the one failure this command must not have.
+    let passphrase = read_passphrase("Passphrase for the snapshot being restored: ")?;
+    let probe = VaultStore::open_at_with_passphrase(source.clone(), &passphrase)
+        .map_err(|e| anyhow::anyhow!("snapshot did not open, nothing was changed: {e}"))?;
+    let count = probe.list().len();
+    drop(probe);
+
+    if vault_path.exists() {
+        let saved = write_backup(&vault_path, None)?;
+        eprintln!("Current vault saved to {}", saved.display());
+    }
+
+    let contents = Zeroizing::new(fs::read(&source)?);
+    platform::write_private(&vault_path, &contents)
+        .map_err(|e| anyhow::anyhow!("failed to write restored vault: {e}"))?;
+
+    // Any cached wrap key belongs to the vault that was just replaced.
+    #[cfg(unix)]
+    if agent_running() {
+        let _ = hearth_vault::agent::control("DROP");
+    }
+
+    eprintln!(
+        "Restored {count} credential(s) to {} from {}",
+        vault_path.display(),
+        source.display()
+    );
+    Ok(())
+}
+
+// ── agent ───────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+fn cmd_agent(ttl: u64, daemon: bool, drop: bool, stop: bool, status: bool) -> anyhow::Result<()> {
+    use hearth_vault::agent;
+
+    if stop {
+        println!("{}", agent::control("STOP")?);
+        return Ok(());
+    }
+    if drop {
+        println!("{}", agent::control("DROP")?);
+        return Ok(());
+    }
+    if status {
+        match agent::control("STATUS") {
+            Ok(reply) => println!("{} at {}", reply, agent::socket_path().display()),
+            Err(_) => {
+                println!("no agent running");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    if daemon {
+        // fork() rather than a thread: the parent must be able to exit and
+        // return the shell prompt while the child keeps the socket open.
+        // SAFETY: fork in a single-threaded process that immediately either
+        // returns (parent) or runs the server loop (child). No allocator
+        // state is shared across the boundary in a way that can deadlock.
+        match unsafe { libc::fork() } {
+            -1 => anyhow::bail!("fork failed: {}", std::io::Error::last_os_error()),
+            0 => {
+                // SAFETY: setsid detaches the child from the controlling
+                // terminal so it survives the shell that started it.
+                unsafe { libc::setsid() };
+                // Must come before serve(): holding the inherited stdout
+                // keeps the parent shell's pipe open, and `agent --daemon`
+                // looks like it hung.
+                agent::detach_stdio();
+                let _ = agent::serve(std::time::Duration::from_secs(ttl));
+                std::process::exit(0);
+            }
+            _ => {
+                // Wait for the socket to answer before returning, so that
+                // `hearth-vault agent --daemon && hearth-vault unlock` cannot
+                // race the agent's own startup.
+                for _ in 0..100 {
+                    if agent::is_running() {
+                        eprintln!(
+                            "agent started at {} (ttl {ttl}s)",
+                            agent::socket_path().display()
+                        );
+                        return Ok(());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                anyhow::bail!("agent did not come up within 2s");
+            }
+        }
+    }
+
+    agent::serve(std::time::Duration::from_secs(ttl))
+}
+
+#[cfg(not(unix))]
+fn cmd_agent(_: u64, _: bool, _: bool, _: bool, _: bool) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "the unlock agent is Unix-only (it needs an AF_UNIX socket). On Windows, seal the \
+         passphrase to the OS keyring instead \u{2014} `hearth-vault seal` \u{2014} which \
+         auto-unlocks with no per-command cost."
+    )
+}
+
+fn cmd_unlock(vault_path: PathBuf) -> anyhow::Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = vault_path;
+        anyhow::bail!("the unlock agent is Unix-only; use `hearth-vault seal` on Windows.")
+    }
+    #[cfg(unix)]
+    {
+        use hearth_vault::agent;
+        if !agent::is_running() {
+            anyhow::bail!(
+                "no agent is running \u{2014} start one first: `hearth-vault agent --daemon`"
+            );
+        }
+        if !vault_path.exists() {
+            anyhow::bail!("no vault at {}", vault_path.display());
+        }
+
+        let passphrase = read_passphrase("Vault passphrase: ")?;
+        // Open once to verify the passphrase before caching it. Caching an
+        // unverified key would turn one typo into fifteen minutes of
+        // confusing "cached key does not open this vault" fallbacks.
+        VaultStore::open_at_with_passphrase(vault_path.clone(), &passphrase)
+            .map_err(|e| anyhow::anyhow!("not unlocked: {e}"))?;
+        let key = VaultStore::derive_wrap_key(&vault_path, &passphrase)?;
+        if agent::try_put(&vault_path, &key) {
+            eprintln!("Unlocked. Commands against this vault will not prompt until the TTL ends.");
+            Ok(())
+        } else {
+            anyhow::bail!("agent refused the key")
+        }
+    }
+}
+
+fn cmd_lock() -> anyhow::Result<()> {
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("the unlock agent is Unix-only.")
+    }
+    #[cfg(unix)]
+    {
+        println!("{}", hearth_vault::agent::control("DROP")?);
+        Ok(())
+    }
+}
+
+// ── sharing ─────────────────────────────────────────────────────────────
+
+fn cmd_identity(vault_path: PathBuf, backend: Option<&str>) -> anyhow::Result<()> {
+    let store = open_vault(vault_path, backend)?;
+    let seed = store.share_identity_seed()?;
+    let identity = hearth_vault::share::public_identity(&seed);
+    println!("{identity}");
+    eprintln!(
+        "fingerprint: {}",
+        hearth_vault::share::fingerprint(&identity)
+    );
+    eprintln!(
+        "This is public. Send it to a teammate so they can `hearth-vault share --to` you; \
+         confirm the fingerprint over a channel other than the one carrying the bundle."
+    );
+    Ok(())
+}
+
+fn cmd_share(
+    vault_path: PathBuf,
+    backend: Option<&str>,
+    prefix: &str,
+    to: &str,
+    output: &str,
+    max_tier: Option<u8>,
+    note: Option<String>,
+) -> anyhow::Result<()> {
+    let store = open_vault(vault_path, backend)?;
+    let entries = store.entries_with_prefix(prefix);
+    if entries.is_empty() {
+        anyhow::bail!("no keys under prefix '{prefix}'");
+    }
+
+    let bundle = hearth_vault::share::seal(&entries, to, max_tier, note)?;
+    let json = serde_json::to_vec_pretty(&bundle)?;
+
+    // Owner-only even though the bundle is encrypted: the file is going to
+    // be moved around by hand, and a 644 secrets-adjacent file invites
+    // exactly the casual copy this tool exists to prevent.
+    let path = PathBuf::from(output);
+    platform::write_private(&path, &json)
+        .map_err(|e| anyhow::anyhow!("failed to write bundle: {e}"))?;
+
+    let shared: Vec<&str> = entries
+        .iter()
+        .filter(|(_, _, t)| *t != hearth_vault::TIER_SIGN_ONLY)
+        .map(|(k, _, _)| k.as_str())
+        .collect();
+    let skipped = entries.len() - shared.len();
+
+    eprintln!("Sealed {} key(s) to {}:", shared.len(), bundle.to);
+    for key in shared {
+        eprintln!("  {key}");
+    }
+    if skipped > 0 {
+        eprintln!(
+            "  ({skipped} tier-{} sign-only key(s) not shareable)",
+            hearth_vault::TIER_SIGN_ONLY
+        );
+    }
+    eprintln!("Bundle: {}", path.display());
+    eprintln!(
+        "Only the holder of that identity can open it. Confirm their fingerprint out of band \
+         before sending \u{2014} a bundle proves the sender knew their public key, not who they are."
+    );
+    Ok(())
+}
+
+fn cmd_receive(
+    vault_path: PathBuf,
+    backend: Option<&str>,
+    file: &str,
+    dry_run: bool,
+    prefix: Option<String>,
+    force: bool,
+) -> anyhow::Result<()> {
+    let raw = fs::read(file).map_err(|e| anyhow::anyhow!("cannot read bundle {file}: {e}"))?;
+    let bundle: hearth_vault::share::Bundle =
+        serde_json::from_slice(&raw).map_err(|e| anyhow::anyhow!("not a bundle file: {e}"))?;
+
+    let mut store = open_vault(vault_path, backend)?;
+    let seed = store.share_identity_seed()?;
+    let (entries, note) = hearth_vault::share::open(&bundle, &seed)?;
+
+    if let Some(note) = note {
+        eprintln!("Note from sender: {note}");
+    }
+
+    let rename = |key: &str| match prefix {
+        Some(ref p) => format!("{p}{}", key.rsplit('/').next().unwrap_or(key)),
+        None => key.to_string(),
+    };
+
+    if dry_run {
+        eprintln!("{} key(s) in this bundle:", entries.len());
+        for e in &entries {
+            eprintln!("  {} (tier {})", rename(&e.key), e.tier);
+        }
+        eprintln!("Nothing was stored. Re-run without --dry-run to accept.");
+        return Ok(());
+    }
+
+    let mut stored = 0usize;
+    let mut skipped = Vec::new();
+    for entry in &entries {
+        let key = rename(&entry.key);
+        if store.has(&key) && !force {
+            skipped.push(key);
+            continue;
+        }
+        store.set(&key, &entry.value, entry.tier)?;
+        eprintln!("  \u{2713} {key} (tier {})", entry.tier);
+        stored += 1;
+    }
+
+    if stored > 0 {
+        store.save()?;
+    }
+    eprintln!("Stored {stored} credential(s) from {file}.");
+    if !skipped.is_empty() {
+        eprintln!(
+            "Skipped {} existing key(s) (pass --force to overwrite): {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
+    Ok(())
+}
+
+// ── git hook / direnv ───────────────────────────────────────────────────
+
+/// The pre-commit hook body. Deliberately tiny and dependency-free: a hook
+/// that breaks when the tool is missing would train people to `--no-verify`,
+/// which is worse than having no hook at all.
+const PRE_COMMIT_HOOK: &str = r#"#!/bin/sh
+# Installed by `hearth-vault install-hook`.
+#
+# Scans the files you are about to commit for secret-shaped strings. Exits
+# non-zero (blocking the commit) if it finds any.
+#
+# If hearth-vault is not on PATH this does nothing rather than blocking your
+# commit -- a hook that fails when the tool is absent teaches people to pass
+# --no-verify, and a bypassed hook protects nobody.
+command -v hearth-vault >/dev/null 2>&1 || exit 0
+
+if ! hearth-vault scan --staged; then
+    echo
+    echo "A secret-shaped string is staged. Options:"
+    echo "  * store it:   hearth-vault set <name>          (then read it via env at runtime)"
+    echo "  * adopt .env: hearth-vault scan --adopt --prefix <project>/"
+    echo "  * false hit:  add a 'hearth-vault:allow' comment on that line"
+    echo "  * override:   git commit --no-verify           (be sure)"
+    exit 1
+fi
+"#;
+
+fn cmd_install_hook(path: Option<String>, force: bool) -> anyhow::Result<()> {
+    let root = PathBuf::from(path.unwrap_or_else(|| ".".to_string()));
+    let git_dir = root.join(".git");
+    if !git_dir.exists() {
+        anyhow::bail!("{} is not a git repository", root.display());
+    }
+
+    // Worktrees and submodules have a `.git` FILE pointing elsewhere; hooks
+    // live in the common dir, not next to the file.
+    let hooks_dir = if git_dir.is_file() {
+        let pointer = fs::read_to_string(&git_dir)?;
+        let target = pointer
+            .trim()
+            .strip_prefix("gitdir:")
+            .ok_or_else(|| anyhow::anyhow!("unreadable .git pointer in {}", root.display()))?
+            .trim();
+        let resolved = root.join(target);
+        resolved.join("hooks")
+    } else {
+        git_dir.join("hooks")
+    };
+    fs::create_dir_all(&hooks_dir)?;
+
+    let hook = hooks_dir.join("pre-commit");
+    if hook.exists() {
+        let existing = fs::read_to_string(&hook).unwrap_or_default();
+        if existing.contains("hearth-vault scan --staged") {
+            eprintln!("Already installed: {}", hook.display());
+            return Ok(());
+        }
+        if !force {
+            anyhow::bail!(
+                "{} already exists \u{2014} inspect it, then re-run with --force (the existing \
+                 hook is backed up, not discarded)",
+                hook.display()
+            );
+        }
+        let backup = hook.with_extension("pre-hearth-vault");
+        fs::rename(&hook, &backup)?;
+        eprintln!("Existing hook moved to {}", backup.display());
+    }
+
+    fs::write(&hook, PRE_COMMIT_HOOK)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
+    }
+    eprintln!("Installed pre-commit hook: {}", hook.display());
+    eprintln!("Test it: `hearth-vault scan --staged`");
+    Ok(())
+}
+
+fn cmd_direnv_init() {
+    print!(
+        r#"# hearth-vault direnv integration.
+#
+# Add to ~/.config/direnv/direnvrc:
+#     eval "$(hearth-vault direnv-init)"
+# Then in a project's .envrc:
+#     use hearth_vault
+#
+# What this exports: HEARTH_VAULT_PREFIX -- a NAME, not a secret. With it set,
+# `hearth-vault exec -- <cmd>` needs no --prefix inside this project.
+#
+# What it deliberately does NOT do: export your secrets into the interactive
+# shell. direnv makes that a two-line temptation, and it would undo the whole
+# point -- every process you launch from that shell, every agent, every `env`
+# dump in a bug report would carry your credentials. Secrets stay in the child
+# process `exec` creates, and nowhere else.
+use_hearth_vault() {{
+    local prefix="${{1:-}}"
+    if [ -z "$prefix" ] && [ -f .hearth-vault ]; then
+        prefix="$(hearth-vault project-prefix 2>/dev/null || true)"
+    fi
+    if [ -z "$prefix" ]; then
+        log_error "use hearth_vault: no prefix given and no .hearth-vault marker found"
+        return 1
+    fi
+    export HEARTH_VAULT_PREFIX="$prefix"
+    watch_file .hearth-vault
+    log_status "hearth-vault: prefix $prefix (run commands with: hearth-vault exec -- <cmd>)"
+}}
+"#
+    );
 }
 
 #[cfg(test)]

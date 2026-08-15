@@ -67,6 +67,10 @@ serde_json = "1"
 sha3 = "0.10"
 thiserror = "2"
 tracing = "0.1"
+# Team sharing only: X25519 to seal a bundle of entries to a teammate's vault
+# identity. `static_secrets` lets us rebuild a stable secret from the data key,
+# so sharing adds no second private key for a user to store, back up, or lose.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = { version = "1", features = ["derive", "zeroize_derive"] }
 
 tss-esapi = { version = "7.6", optional = true }

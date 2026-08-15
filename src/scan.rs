@@ -572,7 +572,14 @@ pub fn scan_path(root: &Path) -> anyhow::Result<Vec<Finding>> {
     } else {
         collect_files(root)
     };
+    scan_files(files)
+}
 
+/// Scan an explicit list of files, bypassing directory walking and the
+/// skip-list. Used by `scan --staged`, where git has already decided what
+/// is in scope: if you deliberately staged a file, "we skip that directory
+/// by default" is not a reason to let a key through.
+pub fn scan_files(files: Vec<PathBuf>) -> anyhow::Result<Vec<Finding>> {
     let mut findings = Vec::new();
 
     for file in files {

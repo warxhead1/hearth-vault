@@ -141,8 +141,14 @@ HEARTH_VAULT_ALLOW_NON_TTY=1
 ```
 init                    First-time setup: create the vault, set a passphrase,
                          print a one-time BIP39 recovery mnemonic.
-set <key>... [--tier]   Store one or more secrets (hidden-input prompt).
-                         Tier defaults to 3 (use-only).
+set <key>... [--tier] [--rotate-days N] [--expires WHEN]
+                         Store one or more secrets (hidden-input prompt).
+                         Tier defaults to 3 (use-only); an existing key keeps
+                         its tier. `--rotate-days N` attaches a rotation
+                         policy, after which every later `set` of that key
+                         advances the due date by itself. `--expires` pins an
+                         exact date (RFC3339, or a relative `30d`/`12w`/`6m`,
+                         or a negative `-7d` to flag something already stale).
 import <file> --key K   Store a secret whose value is the contents of a file.
                          Tier defaults to 3.
 import-env [file] --prefix P [--tier] [--keep] [--force]
@@ -155,7 +161,7 @@ import-env [file] --prefix P [--tier] [--keep] [--force]
 migrate                 Move a legacy `~/.hearth/vault.json` (v1 format)
                          into the current on-disk format at the standard
                          platform data directory.
-scan [path] [--json] [--adopt] [--prefix P] [--rules] [--force]
+scan [path] [--json] [--adopt] [--prefix P] [--rules] [--force] [--staged]
                          Scan a directory (default: current directory) for
                          likely secrets by value shape (cloud/API key
                          formats, PEM headers, connection strings, JWTs,
@@ -167,10 +173,20 @@ scan [path] [--json] [--adopt] [--prefix P] [--rules] [--force]
                          files; findings in source code are reported only,
                          never rewritten. `--rules` lists what `scan`
                          detects. `--force` (with `--adopt`) overwrites
-                         existing vault keys. See MIGRATING.md.
-list                    List stored key names. Never shows values.
+                         existing vault keys. `--staged` scans only what git
+                         has staged, which is what `install-hook` wires into
+                         your pre-commit hook. See MIGRATING.md.
+list [--json] [--due [N]]
+                         List stored key names, tiers, dates, and rotation
+                         status. Never shows values. `--due` filters to
+                         overdue keys (`--due 7` for the coming week) and
+                         exits 1 if any are listed, so it drops into cron or
+                         CI with no output parsing.
 has <key>               Exit 0 if the key exists, non-zero otherwise.
-delete <key>            Remove a secret.
+delete <key> [--no-backup]
+                         Remove a secret, taking an encrypted snapshot of the
+                         vault first (the recovery mnemonic restores the
+                         vault key, not entries you deleted).
 rename <from> <to>      Rename a secret in place.
 retier <key> --tier N   Change a secret's tier (1, 2, 3, or 4).
 export-env <key> --env-name NAME
@@ -180,7 +196,10 @@ export-env-file --prefix P --output FILE
                          Write every tier-1/2 key under prefix P as
                          KEY=value lines to FILE (0600 permissions).
                          Intended for systemd ExecStartPre.
-exec --prefix P -- <command...>
+exec [--prefix P] -- <command...>
+                         `--prefix` is optional: it falls back to
+                         $HEARTH_VAULT_PREFIX, then to the nearest
+                         `.hearth-vault` marker.
                          Inject every tier-1/2/3 key under prefix P into the
                          child's environment (name mapping: strip prefix,
                          uppercase, `/` and `-` -> `_`) and exec the
@@ -199,7 +218,37 @@ github-app-token --installation-id ID [--json] [--repository NAME]...
                          and exchanging it with GitHub. The private key
                          never leaves the vault process; only the resulting
                          token is printed. Works for tier 3 and tier 4 keys.
-status                  Show backend type and key count.
+status [--json]         Show backend type, vault path, permissions, agent
+                         state, and how many keys are due for rotation.
+backup [--output PATH]  Write an encrypted snapshot. Needs no passphrase —
+                         the vault file is already encrypted — so there is no
+                         excuse not to take one.
+restore <file>          Replace the vault with a snapshot. Verifies the
+                         snapshot opens before touching anything, and backs
+                         up what it replaces.
+agent [--ttl N] [--daemon|--stop|--drop|--status]
+                         Short-lived unlock cache, ssh-agent style. Holds a
+                         derived wrap key (not your passphrase, not the data
+                         key) for `--ttl` seconds so repeated commands skip
+                         the ~120ms Argon2id derivation. Unix only.
+unlock                  Prompt once and hand the derived key to the agent.
+lock                    Make the agent forget everything, immediately.
+identity                Print this vault's public sharing identity. Not a
+                         secret — send it to whoever wants to share with you.
+share --prefix P --to ID --output FILE [--max-tier N] [--note TEXT]
+                         Seal every key under P to a teammate's identity,
+                         producing a bundle only they can open. Tier-4 keys
+                         are refused; `--max-tier` hands over a strictly
+                         weaker capability than you hold.
+receive <file> [--dry-run] [--prefix P] [--force]
+                         Open a bundle addressed to you and store its
+                         entries. `--dry-run` shows key names and tiers
+                         without storing or printing anything.
+install-hook [path] [--force]
+                         Install `scan --staged` as this repo's git
+                         pre-commit hook.
+direnv-init             Print a direnv integration snippet. Exports the
+                         project's prefix (a name), never its secrets.
 recover                 Recover vault access using the 24-word recovery
                          mnemonic.
 change-passphrase       Change the vault passphrase.
@@ -210,6 +259,8 @@ new-recovery-key        Generate a fresh 24-word recovery mnemonic,
                          requires the current passphrase.
 prompt                  Print a passphrase prompt for session caching, e.g.
                          `export HEARTH_VAULT_PASSPHRASE=$(hearth-vault prompt)`.
+                         Prefer `agent` + `unlock`: that env var is inherited
+                         by every process you spawn, agents included.
 seal                    Seal the vault passphrase to TPM2 or the OS keyring
                          for auto-unlock on this machine.
 shell-init [bash|zsh|fish]
@@ -337,6 +388,23 @@ model. It is not a substitute for judgment about what you run.
   high-entropy generic pattern). It has no way to catch a secret that's been
   derived, re-encoded, or partially transformed, and it is not a substitute
   for reviewing what you commit.
+- **Sharing gives you confidentiality, not sender authenticity.** A bundle
+  proves its maker knew the recipient's public key; it does not prove who
+  made it. Confirm a teammate's fingerprint out of band, the way you would an
+  SSH host key. Sharing is also a copy and cannot be revoked — un-sharing
+  means rotating at the provider.
+- **The unlock agent does not defend against a process running as you.**
+  Its socket is `0600` in a `0700` directory and every peer is checked with
+  `SO_PEERCRED`, which keeps other *users* out. Anything with your uid can
+  already read `/proc/<pid>/environ` of the children `exec` creates. The
+  agent is strictly better than the `HEARTH_VAULT_PASSPHRASE` env var it
+  replaces — bounded lifetime, not inherited, holds a per-vault wrap key
+  rather than the passphrase — and it is not a substitute for tier 4.
+  Unix only.
+- **Rotation dates are a reminder, not an enforcement.** Nothing stops you
+  using an overdue credential, and the vault has no way to know whether the
+  old value was actually revoked at the provider. Replacing a value here is
+  half of a rotation; the other half happens on someone else's dashboard.
 - **A compromised machine defeats this tool, by design of the threat model
   it targets.** See `SECURITY.md` for exactly what is and is not in scope.
 

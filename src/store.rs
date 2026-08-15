@@ -118,6 +118,18 @@ struct BodyEntry {
     tier: u8,
     created_at: String,
     updated_at: String,
+    /// Rotation *policy*: re-set this credential every N days. Absent means
+    /// no policy — which is what every entry written before this field
+    /// existed deserializes to, so old vaults load unchanged and simply
+    /// report "no policy" rather than "overdue".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rotate_days: Option<u32>,
+    /// Rotation *state*: when this value is next due. Recomputed from
+    /// `rotate_days` on every write, so rotating a secret is the same
+    /// action as storing it — there is no separate "mark as rotated" step
+    /// to forget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<String>,
 }
 
 /// Public metadata for a stored credential (never includes the value).
@@ -127,6 +139,43 @@ pub struct VaultEntry {
     pub tier: u8,
     pub created_at: String,
     pub updated_at: String,
+    pub rotate_days: Option<u32>,
+    pub expires_at: Option<String>,
+}
+
+/// Where a credential stands against its rotation policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationState {
+    /// No `rotate_days` policy set — nothing to be due.
+    NoPolicy,
+    /// Due in this many whole days.
+    Ok { days_left: i64 },
+    /// Overdue by this many whole days.
+    Overdue { days_over: i64 },
+}
+
+impl VaultEntry {
+    /// Compare `expires_at` against now. A malformed timestamp is treated as
+    /// "no policy" rather than an error: a rotation reminder must never be
+    /// the thing that stops you reaching your credentials.
+    pub fn rotation_state(&self) -> RotationState {
+        let Some(ref exp) = self.expires_at else {
+            return RotationState::NoPolicy;
+        };
+        let Ok(exp) = chrono::DateTime::parse_from_rfc3339(exp) else {
+            return RotationState::NoPolicy;
+        };
+        let delta = exp.with_timezone(&Utc) - Utc::now();
+        if delta.num_seconds() < 0 {
+            RotationState::Overdue {
+                days_over: (-delta).num_days(),
+            }
+        } else {
+            RotationState::Ok {
+                days_left: delta.num_days(),
+            }
+        }
+    }
 }
 
 /// Encrypted credential store — format v2 (single-blob body, wrapped data key).
@@ -346,23 +395,59 @@ impl VaultStore {
     /// nothing is written until [`VaultStore::save`] is called.
     pub fn set(&mut self, key: &str, value: &SensitiveString, tier: u8) -> anyhow::Result<()> {
         validate_tier(tier)?;
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
         let entry = if let Some(existing) = self.body.entries.get(key) {
+            // Storing a new value IS the rotation, so the due date moves
+            // forward here rather than in a separate command a user has to
+            // remember to run afterwards.
+            let rotate_days = existing.rotate_days;
             BodyEntry {
                 value: value.as_str().to_string(),
                 tier,
                 created_at: existing.created_at.clone(),
-                updated_at: now,
+                updated_at: now_str,
+                rotate_days,
+                expires_at: due_from(now, rotate_days),
             }
         } else {
             BodyEntry {
                 value: value.as_str().to_string(),
                 tier,
-                created_at: now.clone(),
-                updated_at: now,
+                created_at: now_str.clone(),
+                updated_at: now_str,
+                rotate_days: None,
+                expires_at: None,
             }
         };
         self.body.entries.insert(key.to_string(), entry);
+        Ok(())
+    }
+
+    /// Set (or clear, with `None`) the rotation policy for an existing key,
+    /// recomputing the due date from *now*. Does not persist.
+    pub fn set_rotation(&mut self, key: &str, rotate_days: Option<u32>) -> anyhow::Result<()> {
+        let now = Utc::now();
+        let entry = self
+            .body
+            .entries
+            .get_mut(key)
+            .ok_or_else(|| anyhow::anyhow!("no such key: {key}"))?;
+        entry.rotate_days = rotate_days;
+        entry.expires_at = due_from(now, rotate_days);
+        Ok(())
+    }
+
+    /// Pin an explicit due date, independent of any `rotate_days` policy.
+    /// Used by `set --expires`, for credentials whose expiry the *provider*
+    /// dictates (a 90-day cloud token) rather than your own hygiene rule.
+    pub fn set_expiry(&mut self, key: &str, expires_at: Option<String>) -> anyhow::Result<()> {
+        let entry = self
+            .body
+            .entries
+            .get_mut(key)
+            .ok_or_else(|| anyhow::anyhow!("no such key: {key}"))?;
+        entry.expires_at = expires_at;
         Ok(())
     }
 
@@ -449,6 +534,8 @@ impl VaultStore {
                 tier: entry.tier,
                 created_at: entry.created_at.clone(),
                 updated_at: entry.updated_at.clone(),
+                rotate_days: entry.rotate_days,
+                expires_at: entry.expires_at.clone(),
             })
             .collect()
     }
@@ -504,6 +591,94 @@ impl VaultStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    // ── Agent support: separating the expensive step from the cheap one ──
+    //
+    // Opening a vault is Argon2id (~120ms, deliberately) followed by two AEAD
+    // opens (microseconds). The agent caches the *output* of the expensive
+    // step so repeated `exec` calls pay only the cheap one.
+    //
+    // What is cached is the passphrase-derived WRAP key, not the passphrase
+    // and not the data key. That choice matters:
+    //   - not the passphrase: a compromised agent cannot be used to change
+    //     the passphrase-of-record or to answer a prompt elsewhere, and the
+    //     thing a human reuses across systems never sits in another process.
+    //   - not the data key: the wrap key is bound to the current
+    //     `wrap.passphrase.salt`, so `change-passphrase` re-salts and
+    //     instantly invalidates every cached copy. A data key would survive
+    //     a passphrase change, which is precisely the wrong behaviour.
+
+    /// Derive the passphrase wrap key for the vault at `path` without
+    /// opening it. This is the ~120ms Argon2id step, isolated.
+    pub fn derive_wrap_key(path: &Path, passphrase: &str) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+        let contents = fs::read_to_string(path)?;
+        let file: VaultFileV2 = serde_json::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("corrupt vault file: {e}"))?;
+        if file.version != 2 {
+            anyhow::bail!("unsupported vault format version {}", file.version);
+        }
+        let salt = decode_salt(&file.wrap.passphrase.salt)?;
+        let key = crypto::derive_key_argon2id(passphrase.as_bytes(), &salt, file.kdf)
+            .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
+        Ok(Zeroizing::new(key))
+    }
+
+    /// Open a vault from a previously derived wrap key, skipping Argon2id.
+    ///
+    /// Fails exactly as a wrong passphrase would if the key is stale (the
+    /// vault was re-salted by `change-passphrase`), because the wrap blob
+    /// simply will not open. Callers should fall back to a passphrase, not
+    /// treat this as fatal.
+    pub fn open_at_with_wrap_key(path: PathBuf, wrap_key: &[u8; 32]) -> anyhow::Result<Self> {
+        let contents = fs::read_to_string(&path)?;
+        let file: VaultFileV2 = serde_json::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("corrupt vault file: {e}"))?;
+        if file.version != 2 {
+            anyhow::bail!("unsupported vault format version {}", file.version);
+        }
+        let wrap_blob = B64
+            .decode(&file.wrap.passphrase.blob)
+            .map_err(|e| anyhow::anyhow!("invalid wrap encoding: {e}"))?;
+        let data_key_bytes = crypto::decrypt_aes256gcm(wrap_key, &wrap_blob, AAD_WRAP_PASSPHRASE)
+            .map_err(|_| anyhow::anyhow!("cached key does not open this vault"))?;
+        let data_key = to_key(&data_key_bytes)?;
+        let body = decrypt_body(&data_key, &file.vault)?;
+
+        Ok(Self {
+            path,
+            kdf: file.kdf,
+            wrap_passphrase: file.wrap.passphrase,
+            wrap_recovery: file.wrap.recovery,
+            data_key,
+            body,
+        })
+    }
+
+    // ── Sharing support ─────────────────────────────────────────────────
+
+    /// A stable per-vault X25519 identity, derived from the data key.
+    ///
+    /// Derived rather than stored so that there is no second private key to
+    /// back up, rotate, or lose: whoever can open the vault has the
+    /// identity, and a restored backup keeps the same public key. Domain
+    /// separation via `derive_subkey` means this cannot collide with the
+    /// body key or any future subkey.
+    pub fn share_identity_seed(&self) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+        let seed = crypto::derive_subkey(&self.data_key, "share-identity-x25519")
+            .map_err(|e| anyhow::anyhow!("identity derivation failed: {e}"))?;
+        Ok(Zeroizing::new(seed))
+    }
+
+    /// Every entry under `prefix`, with values. Used only by `share`, which
+    /// re-encrypts them to a recipient — never by anything that prints.
+    pub fn entries_with_prefix(&self, prefix: &str) -> Vec<(String, SensitiveString, u8)> {
+        self.body
+            .entries
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, e)| (k.clone(), SensitiveString::new(e.value.clone()), e.tier))
+            .collect()
+    }
 }
 
 fn decrypt_body(data_key: &[u8; 32], vault_b64: &str) -> anyhow::Result<VaultBody> {
@@ -520,6 +695,14 @@ fn decode_salt(s: &str) -> anyhow::Result<[u8; 32]> {
         .decode(s)
         .map_err(|e| anyhow::anyhow!("invalid salt encoding: {e}"))?;
     to_key(&bytes)
+}
+
+/// `now + days`, or `None` when there is no policy. Days rather than an
+/// exact duration because rotation cadences are human ("every 90 days"), and
+/// a due date that drifts by a few hours is not a defect.
+fn due_from(now: chrono::DateTime<Utc>, rotate_days: Option<u32>) -> Option<String> {
+    let days = rotate_days?;
+    Some((now + chrono::Duration::days(days as i64)).to_rfc3339())
 }
 
 fn to_key(bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
@@ -612,6 +795,8 @@ pub fn migrate_v1_to_v2(path: &Path, passphrase: &str) -> anyhow::Result<()> {
                 tier: e.tier,
                 created_at: e.created_at.clone(),
                 updated_at: e.updated_at.clone(),
+                rotate_days: None,
+                expires_at: None,
             },
         );
     }

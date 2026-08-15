@@ -54,6 +54,30 @@
 - **A weak passphrase.** No amount of KDF tuning turns a guessable
   passphrase into a strong one. The software tier's security ceiling is set
   by your passphrase.
+- **Another process running as your own user.** This bounds the unlock
+  agent specifically. Its socket keeps *other users* out (`0600` in a `0700`
+  directory, plus an `SO_PEERCRED` uid check), but anything running as you
+  can already read `/proc/<pid>/environ` of the children `exec` creates,
+  ptrace them, or simply run `hearth-vault exec` itself. The agent is a
+  strict improvement on the `HEARTH_VAULT_PASSPHRASE` environment variable
+  it replaces — bounded lifetime, not inherited by children, invisible to
+  `ps` and `environ`, and holding a per-vault wrap key rather than the
+  passphrase — and it is not a same-machine isolation boundary.
+- **Who sent you a share bundle.** Bundle confidentiality is real: only the
+  holder of the target identity can open one, and tampering fails closed.
+  Sender authenticity is *not* provided — an ephemeral sender key means a
+  bundle proves only that its maker knew the recipient's public key. Anyone
+  can send you a bundle claiming to be anyone, so confirm a fingerprint out
+  of band before `receive`, exactly as you would an SSH host key. Signed
+  bundles are a reasonable future addition; claiming this already does it
+  would be worse than saying it does not.
+- **Anything after a value reaches a teammate.** Sharing is a copy. There is
+  no revocation, no expiry on a bundle, and no way to un-send one. The only
+  way to withdraw a shared credential is to rotate it at the provider.
+- **Whether a rotation actually happened.** `--rotate-days` and `--expires`
+  track a date. They cannot know whether the old value was revoked upstream,
+  and nothing prevents an overdue credential from being used. A vault-side
+  rotation is half of a rotation.
 
 ## Cryptography
 
@@ -79,6 +103,39 @@
   passphrase and the recovery mnemonic each wrap that data key
   independently, so changing your passphrase rewraps the data key without
   touching or re-encrypting any stored entry.
+- **Sharing:** X25519 ECDH to an ephemeral sender key, HKDF-SHA3-256 over
+  the shared secret salted with `epk ‖ recipient_pub`, then AES-256-GCM
+  under the `hv1:share:v1` AAD. A vault's X25519 identity is derived from
+  its data key via HKDF (`share-identity-x25519`), so there is no second
+  private key to store, back up, or lose, and a restored backup keeps the
+  same public identity. The ephemeral sender key means two bundles to the
+  same recipient share no key material and the sender's own identity is not
+  revealed by the bundle. **Bundles are confidential but not
+  sender-authenticated** — see the threat model below.
+
+## The unlock agent
+
+`hearth-vault agent` caches the passphrase-derived **wrap key** — not the
+passphrase, and not the data key. Both exclusions are deliberate:
+
+- **Not the passphrase.** The secret a human is likely to have reused
+  elsewhere never leaves the process that read it, and a compromised agent
+  cannot be used to change the passphrase of record or answer a prompt
+  somewhere else.
+- **Not the data key.** A wrap key is bound to the current
+  `wrap.passphrase.salt`, so `change-passphrase` re-salts and invalidates
+  every cached copy the instant it runs. A cached data key would survive a
+  passphrase change, which is exactly the wrong behaviour.
+
+Access control is the socket: `0600`, inside a `0700` directory under
+`$XDG_RUNTIME_DIR` (tmpfs, cleared at logout), with every connection checked
+against `SO_PEERCRED`/`getpeereid` to confirm the peer's uid is ours. Keys
+expire on a per-entry TTL (default 900s) and `lock` clears them immediately.
+
+This is a same-user boundary, not a same-machine one — see the threat model.
+Unix only: Windows has no `AF_UNIX` in std, and its answer to the same
+problem is `seal` against the OS keyring, which has no per-invocation KDF
+cost to amortise in the first place.
 
 ## Network behaviour — no telemetry, no phone home
 

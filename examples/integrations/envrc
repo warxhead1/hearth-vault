@@ -1,0 +1,15 @@
+# Copy to a project as `.envrc` (requires: eval "$(hearth-vault direnv-init)"
+# in ~/.config/direnv/direnvrc).
+#
+# This exports HEARTH_VAULT_PREFIX -- a NAME, not a secret -- so that inside
+# this directory `hearth-vault exec -- <cmd>` needs no --prefix.
+#
+# It deliberately does NOT load your secrets into the shell. If you are
+# tempted to add `export API_KEY=$(hearth-vault export-env ...)` below: that
+# is the exact pattern this tool exists to end. Every process launched from
+# that shell inherits it, including every coding agent, and it will show up
+# in the next `env` dump someone pastes into a bug report.
+use hearth_vault
+
+# If there is no .hearth-vault marker, name the prefix explicitly instead:
+# use hearth_vault myapp/

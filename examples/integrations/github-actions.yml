@@ -1,0 +1,61 @@
+# CI that mints a short-lived GitHub App token instead of storing a PAT.
+#
+# The problem this solves: a long-lived PAT in repo secrets is a credential
+# that never expires, is visible to every workflow, and is invisible when it
+# leaks. A GitHub App installation token lives one hour and is scoped to the
+# repositories you name.
+#
+# The App PRIVATE KEY is stored in the vault at tier 4 (sign-only), so it can
+# never be printed or injected into any process -- hearth-vault signs the JWT
+# in its own memory and emits only the resulting token:
+#
+#     hearth-vault import app.private-key.pem --key auth/GITHUB_APP_PRIVATE_KEY --tier 4
+#     hearth-vault set auth/GITHUB_APP_APP_ID
+#
+# In CI the vault itself has to be openable non-interactively, which is what
+# the one repo secret below is for. That is the single credential you still
+# have to trust GitHub with, instead of every credential you own.
+
+name: build
+
+on: [push]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install hearth-vault
+        run: cargo install --git https://github.com/warxhead1/hearth-vault --locked
+
+      # The vault file is committed encrypted, or fetched from wherever you
+      # keep it. It reveals nothing without the passphrase -- entry NAMES are
+      # encrypted too, not just values.
+      - name: Mint a scoped, 1-hour GitHub token
+        id: token
+        env:
+          HEARTH_VAULT_PASSPHRASE: ${{ secrets.HEARTH_VAULT_PASSPHRASE }}
+          HEARTH_VAULT_HOME: ${{ github.workspace }}/.vault
+        run: |
+          TOKEN=$(hearth-vault github-app-token \
+                    --installation-id 12345678 \
+                    --repository myapp --repository myapp-infra)
+          # ::add-mask:: tells the runner to redact this value if it ever
+          # appears in a log line. Do this BEFORE the value can be echoed.
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Use it
+        run: gh repo view myapp-infra
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+
+      # Same binary, second job: block a secret from entering history. This
+      # catches what a local pre-commit hook misses when someone commits with
+      # --no-verify or from a machine without the hook installed.
+      - name: Scan for secrets
+        run: hearth-vault scan .

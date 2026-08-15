@@ -22,6 +22,10 @@ receive only the exit code and whatever non-secret output that process
 produces. You never receive the value itself.
 
 ```sh
+# In a project with a `.hearth-vault` marker, --prefix is optional and you
+# should omit it rather than guess:
+hearth-vault exec -- npm run dev
+
 hearth-vault exec --prefix myapp/ -- npm run dev
 hearth-vault exec --prefix myapp/ -- python manage.py migrate
 # Note the single quotes and the `sh -c`: the env var is expanded by the
@@ -113,6 +117,54 @@ credential into a confusing downstream failure instead of a clear one at
 startup), and no redaction-after-the-fact — the discipline is to never put
 the value where it would need redacting.
 
+## Rotation
+
+Rotating a credential is the same action as storing one: `hearth-vault set
+<key>` keeps the key's tier and moves its due date forward by itself. There
+is no "mark as rotated" step, so do not build one or ask the human for one.
+
+```sh
+hearth-vault list --due       # what is overdue (exit 1 if anything is)
+hearth-vault list --due 7     # what comes due within a week
+```
+
+Both are safe for you to run: names and dates only. The `set` itself is the
+human's job, since it needs the new value.
+
+Say plainly when a rotation is *not* finished: replacing the value in the
+vault does nothing about the old one, which stays live at the provider until
+someone revokes it there.
+
+## Handing a credential to a teammate
+
+Never paste a value into a message, a ticket, or a PR. Seal it instead —
+the value is encrypted to the recipient and neither of you sees it:
+
+```sh
+hearth-vault identity                      # your public identity; not a secret
+hearth-vault share --prefix myapp/ --to <their-identity> --output bundle.hvs
+hearth-vault receive bundle.hvs --dry-run  # key names + tiers, never values
+hearth-vault receive bundle.hvs            # store them
+```
+
+Tell the human to confirm the recipient's fingerprint over a different
+channel first: a bundle proves its maker knew the recipient's public key,
+not who the maker was. Tier-4 keys are refused outright.
+
+Do not open a `.hvs` file to inspect it — use `--dry-run`.
+
+## If commands keep prompting for a passphrase
+
+Ask the human to start the unlock agent. Do **not** work around it by
+setting `HEARTH_VAULT_PASSPHRASE` in your own shell — that variable is
+inherited by every process you spawn, which is exactly the exposure this
+tool exists to prevent.
+
+```sh
+hearth-vault agent --daemon    # human runs this once
+hearth-vault unlock            # human types the passphrase once
+```
+
 ## If a secret leaks into your own output or the transcript
 
 Stop what you're doing. Do not attempt to fix it by deleting the message —
@@ -164,6 +216,14 @@ is compromised.
   into the vault without printing any of its values.
 - `hearth-vault scan [path]` — reports secret-shaped strings by redacted
   match, never a usable value; safe to run and safe to act on its (redacted)
-  report.
+  report. `--staged` limits it to what is staged for commit.
+- `hearth-vault install-hook` — installs the pre-commit scan in this repo.
+  Safe and worth suggesting when you notice a repo without it.
+- `hearth-vault list --due [N]`, `hearth-vault list --json` — rotation state,
+  metadata only.
+- `hearth-vault identity`, `hearth-vault share ...`, `hearth-vault receive
+  <file> [--dry-run]` — sharing; values stay encrypted end to end.
+- `hearth-vault backup` — an encrypted snapshot. Needs no passphrase, prints
+  no values.
 - `hearth-vault project-prefix`, `cat .hearth-vault` — read the project's
   prefix marker, which holds no secret material.

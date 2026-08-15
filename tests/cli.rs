@@ -535,3 +535,422 @@ fn version_flag_reports_the_crate_version() {
         .success()
         .stdout(predicates::str::contains(env!("CARGO_PKG_VERSION")));
 }
+
+// ── rotation state ──────────────────────────────────────────────────────
+
+/// The whole point of storing a policy: a later `set` of the same key moves
+/// the due date forward on its own. If rotation needed a second command,
+/// people would forget it and the dates would be lies.
+#[test]
+fn rotating_a_value_moves_its_due_date_forward() {
+    let fx = VaultFixture::new();
+
+    fx.cmd()
+        .args(["set", "myapp/token", "--rotate-days", "30"])
+        .write_stdin("first-fixture-value\n")
+        .assert()
+        .success();
+
+    let first = String::from_utf8(
+        fx.cmd()
+            .args(["list", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(first.contains("\"rotate_days\": 30"));
+    let first_due = extract_json_string(&first, "expires_at");
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    fx.cmd()
+        .args(["set", "myapp/token"])
+        .write_stdin("second-fixture-value\n")
+        .assert()
+        .success();
+
+    let second = String::from_utf8(
+        fx.cmd()
+            .args(["list", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        second.contains("\"rotate_days\": 30"),
+        "the policy must survive a rotation"
+    );
+    assert_ne!(
+        first_due,
+        extract_json_string(&second, "expires_at"),
+        "storing a new value must push the due date forward"
+    );
+}
+
+/// `list --due` is meant to drop into cron/CI, so the exit code carries the
+/// answer. An overdue key must make it non-zero and a clean vault zero.
+#[test]
+fn list_due_exit_code_reports_overdue_credentials() {
+    let fx = VaultFixture::new();
+
+    // A key with no policy is never "due" -- old entries must not suddenly
+    // start reporting as overdue when a user upgrades.
+    fx.cmd()
+        .args(["set", "myapp/no-policy"])
+        .write_stdin("fixture-value\n")
+        .assert()
+        .success();
+    fx.cmd().args(["list", "--due"]).assert().success();
+
+    // An expiry in the past is overdue.
+    fx.cmd()
+        .args(["set", "myapp/expired", "--expires", "-1d"])
+        .write_stdin("fixture-value\n")
+        .assert()
+        .success();
+    fx.cmd()
+        .args(["list", "--due"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("myapp/expired"));
+}
+
+/// `list --json` is the scripting surface; it must never gain a value field.
+#[test]
+fn list_json_carries_metadata_but_never_values() {
+    let fx = VaultFixture::new();
+    fx.cmd()
+        .args(["set", "myapp/api-key"])
+        .write_stdin("json-fixture-secret-value\n")
+        .assert()
+        .success();
+
+    let out = fx.cmd().args(["list", "--json"]).assert().success();
+    let stdout = &out.get_output().stdout;
+    assert!(contains_bytes(stdout, b"myapp/api-key"));
+    assert!(
+        !contains_bytes(stdout, b"json-fixture-secret-value"),
+        "list --json must never emit a value"
+    );
+}
+
+fn extract_json_string(json: &str, field: &str) -> String {
+    let needle = format!("\"{field}\": \"");
+    let start = json.find(&needle).map(|i| i + needle.len());
+    match start {
+        Some(s) => json[s..].split('"').next().unwrap_or_default().to_string(),
+        None => String::new(),
+    }
+}
+
+// ── backup / restore ────────────────────────────────────────────────────
+
+/// A delete must be undoable, because the recovery mnemonic restores the
+/// vault key and not the entries you removed.
+#[test]
+fn delete_snapshots_first_and_restore_brings_the_key_back() {
+    let fx = VaultFixture::new();
+    fx.cmd()
+        .args(["set", "myapp/precious"])
+        .write_stdin("precious-fixture-value\n")
+        .assert()
+        .success();
+
+    fx.cmd()
+        .args(["delete", "myapp/precious"])
+        .assert()
+        .success();
+    fx.cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("myapp/precious").not());
+
+    // The pre-delete snapshot lands next to the vault file.
+    let snapshot = std::fs::read_dir(fx.home_path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("vault-") && n.ends_with(".json"))
+        })
+        .expect("delete must leave a snapshot behind");
+
+    fx.cmd()
+        .args(["restore", snapshot.to_str().unwrap()])
+        .assert()
+        .success();
+
+    fx.cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("myapp/precious"));
+}
+
+/// Restoring a file that cannot be opened must leave the live vault intact.
+/// Getting this wrong destroys both copies at once.
+#[test]
+fn a_bad_restore_leaves_the_existing_vault_untouched() {
+    let fx = VaultFixture::new();
+    fx.cmd()
+        .args(["set", "myapp/keeper"])
+        .write_stdin("keeper-fixture-value\n")
+        .assert()
+        .success();
+    let before = std::fs::read(fx.vault_file()).unwrap();
+
+    let junk = fx.home_path().join("not-a-vault.json");
+    std::fs::write(&junk, b"{\"version\":2,\"nonsense\":true}").unwrap();
+
+    fx.cmd()
+        .args(["restore", junk.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nothing was changed"));
+
+    assert_eq!(
+        before,
+        std::fs::read(fx.vault_file()).unwrap(),
+        "a failed restore must not modify the live vault"
+    );
+    fx.cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("myapp/keeper"));
+}
+
+// ── sharing ─────────────────────────────────────────────────────────────
+
+/// The full two-party flow, with two genuinely separate vaults.
+#[test]
+fn share_and_receive_between_two_vaults() {
+    let sender = VaultFixture::new();
+    let recipient = VaultFixture::new();
+
+    sender
+        .cmd()
+        .args(["set", "team/db-password"])
+        .write_stdin("shared-fixture-value\n")
+        .assert()
+        .success();
+
+    let identity = String::from_utf8(
+        recipient
+            .cmd()
+            .arg("identity")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert!(identity.starts_with("hv1pub"), "got: {identity}");
+
+    let bundle = sender.home_path().join("bundle.hvs");
+    sender
+        .cmd()
+        .args([
+            "share",
+            "--prefix",
+            "team/",
+            "--to",
+            &identity,
+            "--output",
+            bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // The bundle is a file that gets emailed around: it must not contain
+    // the value in any readable form.
+    let raw = std::fs::read(&bundle).unwrap();
+    assert!(
+        !contains_bytes(&raw, b"shared-fixture-value"),
+        "the bundle must not carry a plaintext value"
+    );
+    assert!(
+        !contains_bytes(&raw, b"team/db-password"),
+        "the bundle must not carry plaintext key names either"
+    );
+
+    recipient
+        .cmd()
+        .args(["receive", bundle.to_str().unwrap()])
+        .assert()
+        .success();
+    recipient
+        .cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("team/db-password"));
+}
+
+/// A bundle addressed to someone else must be refused, and refused with an
+/// explanation rather than a decryption error.
+#[test]
+fn a_third_party_cannot_receive_someone_elses_bundle() {
+    let sender = VaultFixture::new();
+    let recipient = VaultFixture::new();
+    let stranger = VaultFixture::new();
+
+    sender
+        .cmd()
+        .args(["set", "team/secret"])
+        .write_stdin("not-for-the-stranger\n")
+        .assert()
+        .success();
+
+    let identity = String::from_utf8(
+        recipient
+            .cmd()
+            .arg("identity")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let bundle = sender.home_path().join("bundle.hvs");
+    sender
+        .cmd()
+        .args([
+            "share",
+            "--prefix",
+            "team/",
+            "--to",
+            &identity,
+            "--output",
+            bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    stranger
+        .cmd()
+        .args(["receive", bundle.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("addressed to"));
+}
+
+/// Sign-only keys must not be shareable by any route -- that tier's promise
+/// is that the material never leaves the process holding it.
+#[test]
+fn tier_four_keys_cannot_be_shared() {
+    let sender = VaultFixture::new();
+    let recipient = VaultFixture::new();
+
+    sender
+        .cmd()
+        .args(["set", "team/signing-key", "--tier", "4"])
+        .write_stdin("sign-only-fixture-value\n")
+        .assert()
+        .success();
+
+    let identity = String::from_utf8(
+        recipient
+            .cmd()
+            .arg("identity")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    sender
+        .cmd()
+        .args([
+            "share",
+            "--prefix",
+            "team/",
+            "--to",
+            &identity,
+            "--output",
+            sender.home_path().join("b.hvs").to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("sign-only"));
+}
+
+// ── exec prefix discovery ───────────────────────────────────────────────
+
+/// `exec` with no --prefix must find the project marker, so an agent in a
+/// configured repo does not have to guess or hardcode a prefix.
+#[test]
+fn exec_falls_back_to_the_project_marker_for_its_prefix() {
+    let fx = VaultFixture::new();
+    fx.cmd()
+        .args(["set", "marker/api-key"])
+        .write_stdin("marker-fixture-value\n")
+        .assert()
+        .success();
+
+    let project = fx.home_path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join(".hearth-vault"), "marker/\n").unwrap();
+
+    let helper = std::env::current_exe().expect("test binary path");
+    let out = fx
+        .cmd()
+        .current_dir(&project)
+        .env("HV_TEST_ECHO_VAR", "API_KEY")
+        .args([
+            "exec",
+            "--",
+            helper.to_str().unwrap(),
+            "helper_print_env",
+            "--exact",
+            "--nocapture",
+        ])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("HV_ECHO_BEGIN:marker-fixture-value:HV_ECHO_END"),
+        "prefix was not discovered from .hearth-vault; got: {stdout}"
+    );
+}
+
+/// With nothing discoverable, the error must name every way to fix it --
+/// this is the message a new user meets first.
+#[test]
+fn exec_without_a_discoverable_prefix_explains_the_options() {
+    let fx = VaultFixture::new();
+    let empty = fx.home_path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    fx.cmd()
+        .current_dir(&empty)
+        .args(["exec", "--", "true"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("--prefix")
+                .and(predicate::str::contains("HEARTH_VAULT_PREFIX"))
+                .and(predicate::str::contains(".hearth-vault")),
+        );
+}

@@ -1,0 +1,40 @@
+# systemd unit that runs a service with vault secrets in its environment.
+#
+# Install:  ~/.config/systemd/user/myapp.service   (user unit, recommended)
+#           systemctl --user daemon-reload && systemctl --user enable --now myapp
+#
+# The secrets never touch disk: `hearth-vault exec` replaces its own process
+# image with your program, so the value goes straight into the environment of
+# the process systemd is already supervising. Type=exec (not forking) is
+# correct precisely because of that exec().
+
+[Unit]
+Description=myapp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=%h/projects/myapp
+
+# The vault must be openable WITHOUT a human at a terminal. Seal the
+# passphrase to this machine's TPM or keyring once:
+#     hearth-vault seal
+# Then this unit unlocks with no passphrase and no environment variable.
+# Do NOT put the passphrase in Environment= here -- it would be readable via
+# `systemctl show myapp` by anyone who can run it.
+ExecStart=/usr/local/bin/hearth-vault exec --prefix myapp/ -- /usr/local/bin/myapp --port 8080
+
+Restart=on-failure
+RestartSec=5
+
+# Defence in depth: even if the service is compromised, keep it away from
+# the vault file and the rest of the home directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,37 @@
+# For services that will not read their config from the environment their
+# parent gives them and insist on an EnvironmentFile.
+#
+# This is strictly weaker than myapp.service above -- the values exist on a
+# filesystem for a moment -- so use it only when the program leaves you no
+# choice. Three things make it acceptable:
+#
+#   1. /run is tmpfs: never written to disk, gone at reboot.
+#   2. RuntimeDirectoryMode=0700 and hearth-vault's own 0600 file mode mean
+#      only this service's user can read it.
+#   3. ExecStartPost deletes it the moment systemd has read it. systemd
+#      parses EnvironmentFile before ExecStart, so the window is milliseconds.
+#
+# Keys must be tier 1 or 2: `export-env-file` refuses tier 3 by design. If
+# yours are tier 3 (the default), either use myapp.service instead, or
+# `hearth-vault retier <key> --tier 2` and accept that they are now printable.
+
+[Unit]
+Description=myapp (EnvironmentFile variant)
+After=network-online.target
+
+[Service]
+Type=simple
+RuntimeDirectory=myapp
+RuntimeDirectoryMode=0700
+
+ExecStartPre=/usr/local/bin/hearth-vault export-env-file --prefix myapp/ --output /run/myapp/env
+EnvironmentFile=/run/myapp/env
+ExecStart=/usr/local/bin/myapp --port 8080
+ExecStartPost=/bin/rm -f /run/myapp/env
+
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

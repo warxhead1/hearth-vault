@@ -177,6 +177,99 @@ Different directories with different `.hearth-vault` markers get different
 prefixes automatically — direnv-style per-directory behavior with no extra
 tool: `cd` into a project, run `hv <command>`, get that project's secrets.
 
+Bare `hearth-vault exec` finds the marker too, so `--prefix` is optional
+everywhere inside a configured project:
+
+```sh
+hearth-vault exec -- npm run dev
+```
+
+### direnv
+
+If you already use direnv, add it to `~/.config/direnv/direnvrc`:
+
+```sh
+eval "$(hearth-vault direnv-init)"
+```
+
+then in a project's `.envrc`:
+
+```sh
+use hearth_vault
+```
+
+This exports `HEARTH_VAULT_PREFIX` — a **name**, not a secret — so `exec`
+picks the right prefix in that directory. It deliberately does not load your
+credentials into the interactive shell; that is the anti-pattern at the top
+of this section, and direnv makes it a two-line temptation. See
+`examples/integrations/envrc`.
+
+## Stop retyping your passphrase (the unlock agent)
+
+Opening the vault costs one Argon2id derivation, ~120 ms. That is invisible
+once and irritating fifty times, and the old workaround —
+
+```sh
+export HEARTH_VAULT_PASSPHRASE=$(hearth-vault prompt)   # don't
+```
+
+— puts your passphrase in an environment variable that **every child process
+inherits, including every coding agent you launch from that shell**.
+
+Use the agent instead:
+
+```sh
+hearth-vault agent --daemon        # start it (default TTL: 15 minutes)
+hearth-vault unlock                # type the passphrase once
+hearth-vault exec -- npm run dev   # instant, no prompt
+hearth-vault lock                  # forget everything, now
+```
+
+Measured on a desktop: **134 ms → 3 ms per command**, with no passphrase
+anywhere in your environment.
+
+What the agent actually holds is a derived *wrap key*, not your passphrase
+and not the vault's data key. That means `change-passphrase` invalidates
+every cached copy instantly, and the secret you reuse elsewhere never leaves
+the process that read it. The socket is `0600` inside a `0700` directory in
+`$XDG_RUNTIME_DIR`, and every connection is checked with `SO_PEERCRED`.
+
+It defends against other *users*, not against another process running as
+you — anything with your uid can already read `/proc/<pid>/environ` of the
+children `exec` creates. It is strictly better than the env var it replaces;
+it is not a substitute for tier 4.
+
+Add `--ttl 3600` for a longer session. Unix only: on Windows, `hearth-vault
+seal` gives you auto-unlock with no per-command cost at all.
+
+## Stopping secrets at the commit
+
+```sh
+hearth-vault install-hook
+```
+
+Installs a pre-commit hook that scans exactly what you are about to commit
+and blocks it if a secret-shaped string is in there:
+
+```
+$ git commit -m "add config"
+== dotenv-assignment — Unquoted secret assignment in an env file ==
+  .env:1  kT7b…(40 chars)  (suggested key: myapp/secret)
+
+A secret-shaped string is staged. Options:
+  * store it:   hearth-vault set <name>
+  * adopt .env: hearth-vault scan --adopt --prefix <project>/
+  * false hit:  add a 'hearth-vault:allow' comment on that line
+  * override:   git commit --no-verify
+```
+
+The hook does nothing if `hearth-vault` is not on `PATH`, rather than
+failing — a hook that breaks builds for teammates who have not installed the
+tool just teaches everyone to pass `--no-verify`, and a bypassed hook
+protects nobody.
+
+Run the same check by hand, or in CI, with `hearth-vault scan --staged`.
+
 ## CI
 
 Same rule applies in CI: never print the secret, run the thing that needs it
@@ -259,6 +352,42 @@ Overwriting an existing key keeps that key's current tier: rotating a value
 never changes who is allowed to read it. Pass `--tier` explicitly if you do
 want to move it.
 
+### Let the vault track when things are due
+
+Attach a policy once and the vault does the remembering:
+
+```sh
+hearth-vault set myapp/api_key --rotate-days 90    # every 90 days
+hearth-vault set myapp/cloud_token --expires 2026-12-01T00:00:00Z  # provider's date
+hearth-vault set myapp/legacy_key --expires 30d    # or a relative offset
+```
+
+The due date moves forward on its own every time you store a new value —
+rotating *is* storing, so there is no "mark as rotated" step to forget:
+
+```
+$ hearth-vault list
+KEY                                    TIER  CREATED      UPDATED      ROTATION
+----------------------------------------------------------------------------------------
+myapp/api_key                             3  2026-05-02   2026-08-15   due in 89d
+myapp/legacy_key                          3  2026-01-08   2026-01-08   OVERDUE 41d
+myapp/no_policy                           3  2026-03-11   2026-03-11   -
+```
+
+Check it from cron or CI — the exit code is the answer, so nothing has to
+parse the output:
+
+```sh
+hearth-vault list --due      # overdue only;    exit 1 if anything is listed
+hearth-vault list --due 7    # due within a week
+hearth-vault list --json     # metadata for a dashboard (never values)
+```
+
+See `examples/integrations/rotate-check.sh` for a ready-made cron script.
+
+Keys stored before you set a policy simply report `-` and are never counted
+as overdue. `--rotate-days 0` clears a policy.
+
 ### Rotate the vault passphrase
 
 ```sh
@@ -282,12 +411,75 @@ always after `hearth-vault recover` (which rotates it for you automatically,
 since running `recover` means the old phrase was just typed in and should be
 treated as spent).
 
-## Team / multi-machine
+## Sharing with a teammate
 
-There is no shared vault. Each developer runs their own `hearth-vault init`
-on their own machine and imports/sets their own copies of the team's shared
-credentials — the vault file (`vault.json`) is a local encrypted blob, not a
-sync target.
+There is still no shared vault and no server — but you can hand a teammate
+specific credentials without either of you ever seeing a value in a chat
+window.
+
+They run this once and send you the output (it is public, not a secret):
+
+```sh
+hearth-vault identity
+# hv1pubBFfHaX4RZtuza...
+# fingerprint: 3e:ba:49:8b:3f:ff:6e:cd
+```
+
+You seal the keys they need to that identity:
+
+```sh
+hearth-vault share --prefix staging/ --to hv1pubBFfHaX4RZtuza... \
+    --output staging.hvs --note "rotate after the migration lands"
+```
+
+`staging.hvs` is safe to send over Slack, email, or a PR comment: only the
+holder of that identity can open it. They then:
+
+```sh
+hearth-vault receive staging.hvs --dry-run   # see key names and tiers, no values
+hearth-vault receive staging.hvs             # store them
+```
+
+**Confirm the fingerprint over a different channel before you send.** A
+bundle proves its maker knew the recipient's public key — not who the maker
+was. Treat a pasted identity exactly like an SSH host key.
+
+Two more things worth knowing:
+
+- `--max-tier N` hands over a *weaker* capability than you hold. `--max-tier
+  4` shares a signing key the recipient can `sign` with but can never inject
+  or print. Tier is only ever made stricter, never looser.
+- **Tier 4 keys are never shareable at all.** That tier promises the material
+  does not leave the process holding it, and a bundle is that material
+  leaving.
+- Sharing is a **copy, and it is not revocable**. The only way to un-share is
+  to rotate the credential at the provider.
+
+## Backups
+
+The vault file is already encrypted, so a backup is just a copy — and no
+passphrase is needed to make one:
+
+```sh
+hearth-vault backup                       # next to the vault
+hearth-vault backup --output ~/backups    # somewhere you sync
+```
+
+`delete` takes one automatically before removing anything, because the
+recovery mnemonic restores the vault *key*, not entries you deleted.
+
+```sh
+hearth-vault restore ~/backups/vault-20260815T154828Z.json
+```
+
+`restore` proves the snapshot opens **before** it touches your live vault,
+and backs up what it is about to replace. A snapshot is encrypted with the
+passphrase that was in force when it was taken — a later `change-passphrase`
+does not re-key old snapshots.
+
+## Multi-machine
+
+The vault file (`vault.json`) is a local encrypted blob, not a sync target.
 
 - **Never commit `vault.json`.** Already excluded by `.gitignore`
   (`vault.json`); mirror that in any project keeping a vault path inside its
