@@ -347,9 +347,18 @@ impl SecretBackend for Tpm2Backend {
             .map_err(|e| HsmError::UnsealFailed(format!("load sealed object: {e}")))?;
 
         // 3. Start a policy session and bind it to the current PCR0 value.
+        //
+        // The session is SALTED with the primary key (first argument). That is
+        // load-bearing, not tidiness: the attributes below turn on response
+        // parameter encryption, and an unsalted, unbound session has no shared
+        // secret to derive a session key from. The TPM still reports success in
+        // that case and hands back a buffer of exactly the right length holding
+        // bytes that decrypt to nothing -- different garbage on every call,
+        // since the session nonce changes. Silent, and it looks for all the
+        // world like the sealed secret rotated itself.
         let policy_session_handle = ctx
             .start_auth_session(
-                None,
+                Some(parent_handle),
                 None,
                 None,
                 SessionType::Policy,
