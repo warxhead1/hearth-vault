@@ -137,6 +137,11 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+          # A semver pre-release tag carries a hyphen (v0.0.1-rc1); a stable
+          # one does not. Without this every release is marked "latest", so
+          # an rc would become what the download page and any "get the
+          # latest" script hand to someone who wanted a stable build.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             ## Verifying your download
 
