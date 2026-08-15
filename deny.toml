@@ -24,6 +24,16 @@ allow = [
     # webpki-roots (via reqwest, for the GitHub App token exchange). This is
     # Mozilla's CA root bundle -- a data license, permissive, no copyleft.
     "CDLA-Permissive-2.0",
+    # bip39 + bitcoin_hashes + hex-conservative, which generate and check the
+    # recovery mnemonic. CC0 is a public-domain dedication -- strictly more
+    # permissive than MIT, imposing no conditions on redistribution.
+    "CC0-1.0",
+    # option-ext, reached via directories (the crate that knows where a
+    # config directory lives on each OS). MPL-2.0 is FILE-level copyleft: it
+    # obliges publishing changes to the MPL-licensed files themselves, which
+    # we neither make nor plan to. Linking it into an MIT/Apache binary is
+    # explicitly permitted and does not affect our own license.
+    "MPL-2.0",
 ]
 confidence-threshold = 0.8
 

@@ -74,7 +74,33 @@ jobs:
 
       - name: cargo test -- --ignored (OS keyring roundtrip, macOS only)
         if: runner.os == 'macOS'
+        env:
+          RUST_BACKTRACE: "1"
         run: cargo test --lib -- --ignored --exact hsm::os_keyring::tests::test_os_keyring_roundtrip
+
+      # If the roundtrip fails, the useful question is "which keychain did
+      # the write land in, and can the plain `security` CLI round-trip the
+      # same service/account pair at all?" -- that separates a bug in our
+      # code from a keychain the runner never actually made writable.
+      # keyring v3 always resolves SecKeychain::default_for_domain(User) and
+      # cannot be pointed at a named temp keychain, so the default is the
+      # only thing that matters here.
+      - name: Diagnose keychain state (macOS, on failure)
+        if: failure() && runner.os == 'macOS'
+        run: |
+          echo "--- default keychain (user domain) ---"
+          security default-keychain -d user || true
+          echo "--- search list ---"
+          security list-keychains -d user || true
+          echo "--- CLI add/find roundtrip against the same service ---"
+          security add-generic-password -s hearth-vault -a ci-diagnostic \
+            -w not-a-real-secret -U "$HEARTH_VAULT_CI_KEYCHAIN" && echo "add: ok" || echo "add: FAILED"
+          security find-generic-password -s hearth-vault -a ci-diagnostic \
+            "$HEARTH_VAULT_CI_KEYCHAIN" > /dev/null && echo "find(explicit): ok" || echo "find(explicit): FAILED"
+          # No keychain argument = search the default search list, which is
+          # the closest CLI analogue to what the keyring crate does.
+          security find-generic-password -s hearth-vault -a ci-diagnostic \
+            > /dev/null && echo "find(default): ok" || echo "find(default): FAILED"
 
       - name: Remove temporary keychain (macOS only)
         if: runner.os == 'macOS' && always()

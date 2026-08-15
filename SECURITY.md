@@ -80,6 +80,48 @@
   independently, so changing your passphrase rewraps the data key without
   touching or re-encrypting any stored entry.
 
+## Release artifacts — what is and isn't guaranteed
+
+Every tagged release is built by GitHub Actions from the tagged commit, on a
+stock runner of the target architecture. Nothing is cross-compiled, so each
+binary was produced by the real toolchain for the platform it claims. The
+workflow is [`.github/workflows/release.yml`](.github/workflows/release.yml)
+— plain and readable on purpose, because the build pipeline for a secrets
+tool should be auditable without trusting a release-automation framework.
+
+**Verify what you download.** Each artifact ships a `.sha256`, and the
+release carries a combined `SHA256SUMS`:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+Two things these artifacts do **not** currently give you:
+
+- **They are not code-signed.** macOS Gatekeeper and Windows SmartScreen
+  will warn on first run. Signing needs an Apple Developer ID and an
+  Authenticode certificate held as repository secrets; neither is set up
+  yet. Until then, checksum verification is the check that matters — or
+  build from source:
+  `cargo install --locked --git https://github.com/warxhead1/hearth-vault`.
+- **The build is not reproducible.** An identical rebuild is not
+  bit-for-bit guaranteed, so a checksum proves *what CI produced*, not
+  independently *what the source implies*.
+
+### The musl build has no OS keyring
+
+`x86_64-unknown-linux-musl` is the static, runs-on-any-distro artifact, and
+it is built with `--no-default-features`. That is deliberate rather than an
+oversight: the OS-keyring tier reaches the Secret Service over D-Bus via
+libsecret, which is dynamically loaded and cannot be linked into a static
+binary. A musl build advertising keyring support would fail at runtime on
+exactly the minimal systems it exists for.
+
+So on the musl artifact, **tier 2 (OS keyring) is unavailable** —
+passphrase and recovery-mnemonic wrapping work normally. TPM2 (tier 1) is a
+separate opt-in feature and is in no prebuilt artifact at all. If you want
+the OS-keyring tier on Linux, use a `-gnu` build.
+
 ## Reporting a vulnerability
 
 Please do not open a public GitHub issue for a security vulnerability.

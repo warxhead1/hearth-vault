@@ -44,5 +44,16 @@ else
     echo "==> SKIP gitleaks (not installed)"
 fi
 
+# The Audit workflow runs this separately from CI, so a green CI run says
+# nothing about it. Licenses are the part that bites: a routine dependency
+# bump can pull in a new transitive crate under a license we have not
+# reviewed, and that fails only here.
+if command -v cargo-deny >/dev/null; then
+    echo "==> cargo deny check"
+    cargo deny check
+else
+    echo "==> SKIP cargo deny (cargo install cargo-deny --locked)"
+fi
+
 echo
 echo "preflight OK"
