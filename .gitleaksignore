@@ -10,3 +10,9 @@
 1d5fba45d4d1816eecf4f60ce6c6162a2fc2adbc:src/scan.rs:generic-api-key:881
 1d5fba45d4d1816eecf4f60ce6c6162a2fc2adbc:src/scan.rs:generic-api-key:882
 1d5fba45d4d1816eecf4f60ce6c6162a2fc2adbc:src/scan.rs:generic-api-key:915
+
+# exec --redact test fixture (src/redact.rs), same non-credential synthetic
+# string added across two commits before it carried an inline allow marker --
+# both fingerprints point at the same fixture value, not a real secret.
+86fb915177ee1f84e5236f51c492587fe709a592:src/redact.rs:generic-api-key:203
+ab319aa08fb7b7276e94c6d1d83f965d42c0775a:src/redact.rs:generic-api-key:208
