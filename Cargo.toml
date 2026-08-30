@@ -43,6 +43,11 @@ github-app-token = ["dep:reqwest"]
 
 [dependencies]
 aes-gcm = "0.10"
+# Streaming, multi-pattern, longest-match-wins search for `exec --redact`'s
+# output scrubber. Already a transitive dependency (via `regex`), so this
+# adds no new supply-chain surface -- just a direct edge on a crate already
+# in the tree.
+aho-corasick = "1"
 anyhow = "1"
 argon2 = "0.5"
 base64 = "0.22"

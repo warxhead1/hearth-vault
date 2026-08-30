@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use hearth_vault::hsm::platform;
+use hearth_vault::redact::Redactor;
 use hearth_vault::{RotationState, SensitiveString, TIER_SIGN_ONLY, TIER_USE_ONLY, VaultStore};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -243,6 +244,35 @@ enum Commands {
         /// and an agent does not have to guess or hardcode a prefix.
         #[arg(short, long)]
         prefix: Option<String>,
+        /// Scrub every injected secret VALUE (and its URL-percent-encoded
+        /// form) out of the child's stdout and stderr before it reaches the
+        /// caller, replacing each occurrence with `<vault:KEY_NAME>`.
+        ///
+        /// OFF BY DEFAULT — equivalent env var: HEARTH_VAULT_REDACT=1. This
+        /// kills a real incident class: an API echoing an injected key back
+        /// in a response body, or a script that interpolates a DSN password
+        /// into its own log line, both land in whatever reads the child's
+        /// output (a human terminal, or — the case this exists for — an
+        /// agent transcript that gets transmitted off-box).
+        ///
+        /// Do NOT turn this on for a consumer that CAPTURES exec's output as
+        /// the value itself — e.g. `VAR="$(hearth-vault exec ... sh -c
+        /// 'printf %s "$VAR"')"`, the pattern tachyonac-engine's
+        /// deploy/deploy.sh and scripts/devdb.sh both use. `--redact` would
+        /// silently hand that capture the literal string `<vault:VAR>`
+        /// instead of the real value, breaking the consumer outright. It is
+        /// for the "the child prints logs/output I might read or forward"
+        /// case, not the "I need the value back" case — that case is what
+        /// plain `exec` (no flag) is for.
+        ///
+        /// Values under 8 bytes are never redacted (too collision-prone to
+        /// distinguish from ordinary output). Forces stdout/stderr to be
+        /// captured through a pipe rather than inherited directly from the
+        /// terminal — for a fully interactive child (e.g. one reading raw
+        /// terminal input/resize events) this can change behavior; plain
+        /// `exec` still gives an unmodified TTY passthrough.
+        #[arg(long)]
+        redact: bool,
         /// Command and arguments to run (everything after `--`)
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -831,7 +861,11 @@ fn main() -> anyhow::Result<()> {
         Commands::ExportEnvFile { prefix, output } => {
             cmd_export_env_file(vault_path, backend, &prefix, &output)?
         }
-        Commands::Exec { prefix, command } => cmd_exec(vault_path, backend, prefix, &command)?,
+        Commands::Exec {
+            prefix,
+            redact,
+            command,
+        } => cmd_exec(vault_path, backend, prefix, redact, &command)?,
         Commands::Sign {
             key,
             algorithm,
@@ -1831,10 +1865,19 @@ fn collect_exec_env(store: &VaultStore, prefix: &str) -> anyhow::Result<ExecEnv>
     Ok((injected, skipped_use_only))
 }
 
+/// True when `exec` should scrub injected secret values out of the child's
+/// stdout/stderr: either `--redact` was passed, or the equivalent
+/// `HEARTH_VAULT_REDACT` env var is set (same "unset/0/empty means no"
+/// convention as `HEARTH_VAULT_VERBOSE`, see `verbose()`).
+fn redact_requested(flag: bool) -> bool {
+    flag || std::env::var("HEARTH_VAULT_REDACT").is_ok_and(|v| v != "0" && !v.is_empty())
+}
+
 fn cmd_exec(
     vault_path: PathBuf,
     backend: Option<&str>,
     prefix: Option<String>,
+    redact: bool,
     command: &[String],
 ) -> anyhow::Result<()> {
     let (program, args) = command
@@ -1869,6 +1912,15 @@ fn cmd_exec(
         cmd.env(name, value.as_str());
     }
 
+    if redact_requested(redact) {
+        note!(
+            "--redact: scrubbing {} injected value(s) from `{}`'s stdout/stderr.",
+            injected.len(),
+            program
+        );
+        return exec_with_redaction(cmd, &injected);
+    }
+
     // On Unix, replace this process image with the child so exit codes and
     // signals pass through unchanged and the injected secrets never outlive
     // the exec. `exec()` only returns on failure.
@@ -1882,6 +1934,105 @@ fn cmd_exec(
     {
         let status = cmd.status()?;
         std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+/// Runs `cmd` with stdout/stderr piped (rather than inherited/exec'd)
+/// through a [`Redactor`] built from `injected`, so every occurrence of an
+/// injected secret value — or its URL-percent-encoded form — is replaced
+/// with `<vault:KEY_NAME>` before it reaches this process's own stdout or
+/// stderr. Stdin stays inherited (a redirected/interactive child still gets
+/// its input normally; only the output side needs scrubbing).
+///
+/// This intentionally does NOT use `exec()` (unlike the non-redact path):
+/// there is no way to intercept a replaced process image's I/O, so this
+/// path pays the cost of a real child process (spawn + wait) instead of a
+/// process-image replacement. Exit code passes through unchanged; on Unix a
+/// child killed by a signal is reported the same way a shell reports it
+/// (128 + signal number).
+fn exec_with_redaction(
+    mut cmd: std::process::Command,
+    injected: &[(String, SensitiveString)],
+) -> anyhow::Result<()> {
+    use std::process::Stdio;
+
+    let redactor = Redactor::new(injected.iter().map(|(n, v)| (n.as_str(), v.as_str().as_bytes())));
+
+    cmd.stdin(Stdio::inherit());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("failed to spawn child: {e}"))?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("child stdout was not piped"))?;
+    let child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("child stderr was not piped"))?;
+
+    // One thread per stream so a child that fills its stdout pipe while
+    // blocked writing to stderr (or vice versa) can never deadlock this
+    // process — both streams are always being drained concurrently.
+    let out_redactor = redactor.clone();
+    let out_thread = std::thread::spawn(move || {
+        pump_redacted(child_stdout, std::io::stdout(), out_redactor)
+    });
+    let err_redactor = redactor.clone();
+    let err_thread = std::thread::spawn(move || {
+        pump_redacted(child_stderr, std::io::stderr(), err_redactor)
+    });
+
+    // Drain both threads before waiting on the child: the child's pipes
+    // must hit EOF (which only happens once the process has exited or
+    // closed the fds) before either thread returns, so this ordering does
+    // not risk missing output.
+    let out_result = out_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout redaction thread panicked"))?;
+    let err_result = err_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr redaction thread panicked"))?;
+    out_result?;
+    err_result?;
+
+    let status = child.wait()?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            std::process::exit(128 + signal);
+        }
+    }
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Copies `src` to `dst` in bounded-size chunks, redacting each chunk
+/// through `redactor` (with a proper carry-buffer flush at EOF) before it is
+/// written out. Used identically for stdout and stderr.
+fn pump_redacted<R: std::io::Read, W: std::io::Write>(
+    mut src: R,
+    mut dst: W,
+    redactor: Redactor,
+) -> anyhow::Result<()> {
+    let mut stream = redactor.stream();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            let tail = stream.process(&[], true);
+            if !tail.is_empty() {
+                dst.write_all(&tail)?;
+            }
+            dst.flush()?;
+            return Ok(());
+        }
+        let out = stream.process(&buf[..n], false);
+        if !out.is_empty() {
+            dst.write_all(&out)?;
+        }
     }
 }
 

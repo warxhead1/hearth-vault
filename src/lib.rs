@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod crypto;
 pub mod hsm;
+pub mod redact;
 pub mod scan;
 pub mod sensitive;
 pub mod share;

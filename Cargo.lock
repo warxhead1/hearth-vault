@@ -986,6 +986,7 @@ name = "hearth-vault"
 version = "0.0.1-rc1"
 dependencies = [
  "aes-gcm",
+ "aho-corasick",
  "anyhow",
  "argon2",
  "assert_cmd",

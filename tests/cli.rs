@@ -333,6 +333,110 @@ fn exec_maps_hyphen_to_underscore_in_env_name() {
     );
 }
 
+/// `exec --redact` scrubs an injected secret value that the child echoes
+/// back on its own stdout, replacing it with `<vault:KEY_NAME>` — the
+/// exact incident class (an API/script echoing an injected value back into
+/// output an agent then reads) this flag exists to kill.
+#[test]
+fn exec_redact_scrubs_value_the_child_echoes_to_stdout() {
+    let fx = VaultFixture::new();
+    // Long enough to clear the 8-byte redaction floor.
+    let secret_value = "exec-redact-fixture-value-should-not-appear"; // hearth-vault:allow (test fixture, not a credential)
+
+    fx.cmd()
+        .args(["set", "myapp/api-key", "--tier", "3"])
+        .write_stdin(format!("{secret_value}\n"))
+        .assert()
+        .success();
+
+    let helper = std::env::current_exe().expect("path to this test binary");
+
+    let assert = fx
+        .cmd()
+        .env("HV_TEST_ECHO_VAR", "API_KEY")
+        .args(["exec", "--prefix", "myapp/", "--redact", "--"])
+        .arg(&helper)
+        .args(["helper_print_env", "--exact", "--nocapture"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        !stdout.contains(secret_value),
+        "raw secret leaked through --redact:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("<vault:API_KEY>"),
+        "expected placeholder not found in redacted output:\n{stdout}"
+    );
+}
+
+/// Plain `exec` (no `--redact`) is unchanged: an echoed secret still comes
+/// through verbatim. This pins the opt-in contract — redaction must never
+/// engage unless asked for, because existing consumers (e.g.
+/// tachyonac-engine's deploy scripts) capture exec's passthrough output as
+/// the value itself.
+#[test]
+fn exec_without_redact_still_passes_the_value_through_verbatim() {
+    let fx = VaultFixture::new();
+    let secret_value = "exec-no-redact-fixture-value-passthrough"; // hearth-vault:allow (test fixture, not a credential)
+
+    fx.cmd()
+        .args(["set", "myapp/api-key", "--tier", "3"])
+        .write_stdin(format!("{secret_value}\n"))
+        .assert()
+        .success();
+
+    let helper = std::env::current_exe().expect("path to this test binary");
+
+    let assert = fx
+        .cmd()
+        .env("HV_TEST_ECHO_VAR", "API_KEY")
+        .args(["exec", "--prefix", "myapp/", "--"])
+        .arg(&helper)
+        .args(["helper_print_env", "--exact", "--nocapture"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let marker = format!("HV_ECHO_BEGIN:{secret_value}:HV_ECHO_END");
+    assert!(
+        stdout.contains(&marker),
+        "expected unredacted marker not found:\n{stdout}"
+    );
+}
+
+/// `HEARTH_VAULT_REDACT=1` is equivalent to `--redact`.
+#[test]
+fn exec_redact_env_var_is_equivalent_to_the_flag() {
+    let fx = VaultFixture::new();
+    let secret_value = "exec-redact-env-var-fixture-value-x"; // hearth-vault:allow (test fixture, not a credential)
+
+    fx.cmd()
+        .args(["set", "myapp/api-key", "--tier", "3"])
+        .write_stdin(format!("{secret_value}\n"))
+        .assert()
+        .success();
+
+    let helper = std::env::current_exe().expect("path to this test binary");
+
+    let assert = fx
+        .cmd()
+        .env("HV_TEST_ECHO_VAR", "API_KEY")
+        .env("HEARTH_VAULT_REDACT", "1")
+        .args(["exec", "--prefix", "myapp/", "--"])
+        .arg(&helper)
+        .args(["helper_print_env", "--exact", "--nocapture"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        !stdout.contains(secret_value),
+        "raw secret leaked despite HEARTH_VAULT_REDACT=1:\n{stdout}"
+    );
+}
+
 // ── tier-4 (sign-only): never exec-injected, never exportable ──────────
 
 #[test]
