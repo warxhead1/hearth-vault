@@ -205,7 +205,7 @@ mod tests {
     /// 1. A value split exactly across a chunk boundary is still redacted.
     #[test]
     fn value_split_across_chunk_boundary_is_redacted() {
-        let secret = "correct-horse-battery-staple-42"; // fixture, not real
+        let secret = "correct-horse-battery-staple-42"; // hearth-vault:allow (test fixture, not a credential)
         let r = redactor(&[("DB_PASSWORD", secret)]);
         let mut s = r.stream();
 
@@ -279,7 +279,7 @@ mod tests {
     /// behavior, not a strict benchmark; it just needs to finish fast.
     #[test]
     fn multi_megabyte_stream_has_no_quadratic_blowup() {
-        let secret = "quadratic-blowup-canary-fixture-value"; // fixture
+        let secret = "quadratic-blowup-canary-fixture-value"; // hearth-vault:allow (test fixture, not a credential)
         let r = redactor(&[("CANARY", secret)]);
         let mut s = r.stream();
 
@@ -317,7 +317,7 @@ mod tests {
     /// and redacted by the final `eof: true` call, not silently dropped.
     #[test]
     fn carry_buffer_flushes_at_eof_when_value_ends_the_stream() {
-        let secret = "trailing-value-ends-the-stream-fixture"; // fixture
+        let secret = "trailing-value-ends-the-stream-fixture"; // hearth-vault:allow (test fixture, not a credential)
         let r = redactor(&[("API_KEY", secret)]);
         let mut s = r.stream();
 
