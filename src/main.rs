@@ -1956,13 +1956,19 @@ fn exec_with_redaction(
 ) -> anyhow::Result<()> {
     use std::process::Stdio;
 
-    let redactor = Redactor::new(injected.iter().map(|(n, v)| (n.as_str(), v.as_str().as_bytes())));
+    let redactor = Redactor::new(
+        injected
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str().as_bytes())),
+    );
 
     cmd.stdin(Stdio::inherit());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("failed to spawn child: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn child: {e}"))?;
     let child_stdout = child
         .stdout
         .take()
@@ -1976,13 +1982,11 @@ fn exec_with_redaction(
     // blocked writing to stderr (or vice versa) can never deadlock this
     // process — both streams are always being drained concurrently.
     let out_redactor = redactor.clone();
-    let out_thread = std::thread::spawn(move || {
-        pump_redacted(child_stdout, std::io::stdout(), out_redactor)
-    });
+    let out_thread =
+        std::thread::spawn(move || pump_redacted(child_stdout, std::io::stdout(), out_redactor));
     let err_redactor = redactor.clone();
-    let err_thread = std::thread::spawn(move || {
-        pump_redacted(child_stderr, std::io::stderr(), err_redactor)
-    });
+    let err_thread =
+        std::thread::spawn(move || pump_redacted(child_stderr, std::io::stderr(), err_redactor));
 
     // Drain both threads before waiting on the child: the child's pipes
     // must hit EOF (which only happens once the process has exited or

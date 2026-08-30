@@ -99,7 +99,12 @@ impl Redactor {
             }
         }
 
-        let hold_back = patterns.iter().map(Vec::len).max().unwrap_or(0).saturating_sub(1);
+        let hold_back = patterns
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
 
         // LeftmostLongest: at any position where more than one pattern
         // could match, the longest one wins outright rather than the first
@@ -245,7 +250,11 @@ mod tests {
     fn percent_encoded_form_in_a_url_is_redacted() {
         let raw = "p@ss:w/ord+123"; // fixture DSN-style password with reserved chars
         let encoded = percent_encode(raw.as_bytes());
-        assert_ne!(encoded, raw.as_bytes(), "fixture must actually need encoding");
+        assert_ne!(
+            encoded,
+            raw.as_bytes(),
+            "fixture must actually need encoding"
+        );
 
         let r = redactor(&[("DATABASE_PASSWORD", raw)]);
         let mut s = r.stream();
@@ -297,7 +306,10 @@ mod tests {
             elapsed.as_secs() < 5,
             "streaming ~4MiB took suspiciously long ({elapsed:?}); check for quadratic behavior"
         );
-        assert!(redacted_count > 0, "test fixture produced no secret occurrences");
+        assert!(
+            redacted_count > 0,
+            "test fixture produced no secret occurrences"
+        );
     }
 
     /// 5. A value that ends exactly at end-of-stream is still flushed and
