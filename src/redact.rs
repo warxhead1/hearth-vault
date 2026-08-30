@@ -226,8 +226,9 @@ mod tests {
         assert_eq!(out, "before=<vault:DB_PASSWORD>=after");
     }
 
-    /// 2. Two secrets where one is a byte-for-byte substring of the other:
-    /// the longer one must win, not get shredded around the short match.
+    /// Case 2: two secrets where one is a byte-for-byte substring of the
+    /// other — the longer one must win, not get shredded around the short
+    /// match.
     #[test]
     fn substring_secret_does_not_shred_the_longer_one() {
         let short = "tok_abcdefgh"; // fixture
@@ -273,9 +274,9 @@ mod tests {
         );
     }
 
-    /// 4. Multi-megabyte throughput sanity: a streaming matcher should not
-    /// blow up quadratically. This is a smoke test on wall-clock behavior,
-    /// not a strict benchmark — it just needs to finish fast.
+    /// Case 4: multi-megabyte throughput sanity — a streaming matcher should
+    /// not blow up quadratically. This is a smoke test on wall-clock
+    /// behavior, not a strict benchmark; it just needs to finish fast.
     #[test]
     fn multi_megabyte_stream_has_no_quadratic_blowup() {
         let secret = "quadratic-blowup-canary-fixture-value"; // fixture
@@ -312,8 +313,8 @@ mod tests {
         );
     }
 
-    /// 5. A value that ends exactly at end-of-stream is still flushed and
-    /// redacted by the final `eof: true` call, not silently dropped.
+    /// Case 5: a value that ends exactly at end-of-stream is still flushed
+    /// and redacted by the final `eof: true` call, not silently dropped.
     #[test]
     fn carry_buffer_flushes_at_eof_when_value_ends_the_stream() {
         let secret = "trailing-value-ends-the-stream-fixture"; // fixture
