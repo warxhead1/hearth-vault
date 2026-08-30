@@ -196,7 +196,7 @@ export-env-file --prefix P --output FILE
                          Write every tier-1/2 key under prefix P as
                          KEY=value lines to FILE (0600 permissions).
                          Intended for systemd ExecStartPre.
-exec [--prefix P] -- <command...>
+exec [--prefix P] [--redact] -- <command...>
                          `--prefix` is optional: it falls back to
                          $HEARTH_VAULT_PREFIX, then to the nearest
                          `.hearth-vault` marker.
@@ -207,6 +207,13 @@ exec [--prefix P] -- <command...>
                          agent-safe consumption path, and the one
                          value-bearing command not subject to the non-TTY
                          rule.
+                         `--redact` (or HEARTH_VAULT_REDACT=1): scrub every
+                         injected value out of the child's stdout/stderr
+                         before it reaches you, replacing it with
+                         `<vault:KEY_NAME>`. OFF by default -- see
+                         "Redacting a child's output" below before turning
+                         it on for a script that captures exec's output as
+                         the value.
 sign --key K --algorithm ALG --message M
                          Sign M with the private key stored at K. Algorithms:
                          RSA-PSS-SHA256, RS256, RS512. Prints a base64
@@ -355,6 +362,46 @@ Three drop-in files do that, and none of them require the agent to be clever:
 The short version of all three: agents run `hearth-vault exec -- <command>`
 and `hearth-vault sign`; they never run `export-env`, never `cat` a `.env`,
 and never put a value in a variable they might later echo.
+
+### Redacting a child's output
+
+Vault injection keeps a secret out of the environment you can see — but the
+child process you exec'd can still print it right back: an API that echoes
+an injected key in a response body, a script that interpolates a DSN
+password into its own log line, a stack trace with a secret baked into a
+URL. Whatever reads that output next (a human terminal, or an agent whose
+whole transcript gets sent off-box) now has the value too.
+
+`hearth-vault exec --redact --prefix P -- <command...>` (equivalently,
+`HEARTH_VAULT_REDACT=1`) scrubs every injected secret's value — and its
+URL-percent-encoded form, where that differs from the raw value — out of
+the child's stdout and stderr, replacing each occurrence with
+`<vault:KEY_NAME>`. It is binary-safe and streaming: a value split across
+two chunks of output is still caught, and if one secret's value happens to
+be a substring of another's, the longer one wins outright rather than
+getting shredded around a false match. Values under 8 bytes are never
+redacted — anything shorter collides too easily with ordinary output.
+
+**`--redact` is OFF by default, and stays that way for a reason.** Some
+consumers deliberately capture `exec`'s output *as* the value:
+
+```sh
+DATABASE_URL="$(hearth-vault exec --prefix myapp/ -- sh -c 'printf %s "$DATABASE_URL"')"
+```
+
+Turn on `--redact` for that invocation and the capture gets the literal
+string `<vault:DATABASE_URL>` instead of the real value — which is exactly
+what you want for a value you are about to *hand to a human or an agent to
+read*, and exactly what breaks a deploy script relying on the value itself.
+Reach for `--redact` when the child's output is something you (or an
+agent) might read or forward; leave it off when the output *is* the
+credential you asked `exec` to hand back.
+
+One more trade-off: `--redact` forces the child's stdout/stderr to be
+captured through a pipe instead of inherited straight from your terminal.
+For a fully interactive program (one reading raw terminal input, resize
+events, etc.) that can change behavior; plain `exec` (no flag) still gives
+an unmodified TTY passthrough.
 
 ## Limitations
 
