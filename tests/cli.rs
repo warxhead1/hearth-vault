@@ -111,6 +111,81 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn init_machine_is_noninteractive_and_recovery_is_recipient_encrypted() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = VaultFixture::new();
+    let bin_dir = fx.home_path().join("bin");
+    std::fs::create_dir(&bin_dir).unwrap();
+    let fake = bin_dir.join("systemd-creds");
+    let helper_log = fx.home_path().join("systemd-creds.args");
+    std::fs::write(
+        &fake,
+        b"#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$HEARTH_VAULT_TEST_SYSTEMD_CREDS_LOG\"\ncase \"$1\" in --version) exit 0;; encrypt|decrypt) cat; exit 0;; *) exit 64;; esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let recovery_output = fx.home_path().join("machine-recovery.hvs");
+    let identity = hearth_vault::share::public_identity(&[9u8; 32]);
+
+    let initialized = fx
+        .cmd()
+        .env("HEARTH_VAULT_TEST_SYSTEMD_CREDS", &fake)
+        .env("HEARTH_VAULT_TEST_SYSTEMD_CREDS_LOG", &helper_log)
+        .env_remove("HEARTH_VAULT_PASSPHRASE")
+        .args([
+            "--backend",
+            "systemd-creds",
+            "init-machine",
+            "--recovery-recipient",
+            &identity,
+            "--recovery-output",
+            recovery_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no secret value was printed"));
+    let combined = [
+        initialized.get_output().stdout.as_slice(),
+        initialized.get_output().stderr.as_slice(),
+    ]
+    .concat();
+    assert!(!contains_bytes(&combined, b"machine/recovery-mnemonic"));
+
+    fx.cmd()
+        .env("HEARTH_VAULT_TEST_SYSTEMD_CREDS", &fake)
+        .env("HEARTH_VAULT_TEST_SYSTEMD_CREDS_LOG", &helper_log)
+        .env_remove("HEARTH_VAULT_PASSPHRASE")
+        .args(["--backend", "systemd-creds", "status"])
+        .assert()
+        .success();
+
+    let helper_args = std::fs::read_to_string(&helper_log).unwrap();
+    assert!(helper_args.contains("encrypt --name=hearth-vault --with-key=host - -"));
+    assert!(helper_args.contains("decrypt --name=hearth-vault - -"));
+
+    let bundle: hearth_vault::share::Bundle =
+        serde_json::from_slice(&std::fs::read(&recovery_output).unwrap()).unwrap();
+    let (entries, _) = hearth_vault::share::open(&bundle, &[9u8; 32]).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key, "machine/recovery-mnemonic");
+    assert_eq!(entries[0].tier, 3);
+
+    let sealed = fx.home_path().join("vault-passphrase.sealed");
+    let mut tampered = std::fs::read(&sealed).unwrap();
+    tampered[0] ^= 0x01;
+    std::fs::write(&sealed, tampered).unwrap();
+    fx.cmd()
+        .env("HEARTH_VAULT_TEST_SYSTEMD_CREDS", &fake)
+        .env("HEARTH_VAULT_TEST_SYSTEMD_CREDS_LOG", &helper_log)
+        .env_remove("HEARTH_VAULT_PASSPHRASE")
+        .arg("list")
+        .assert()
+        .failure();
+}
+
 // ── set / list / has / delete ───────────────────────────────────────────
 
 #[test]

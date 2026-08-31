@@ -13,9 +13,12 @@
 //! i.e. a second master secret sitting in the process environment, readable
 //! from `/proc/<pid>/environ` and inherited by every child. Both are gone.
 //!
-//! With no hardware backend, the honest answer is: type your passphrase. The
-//! vault contents are still Argon2id + AES-256-GCM encrypted at rest — that
-//! *is* the software tier, and it lives in `store.rs` where it belongs.
+//! Headless Linux root services may use the explicit `systemd-creds` backend.
+//! It is host-bound OS protection, not hardware: root compromise can decrypt
+//! it, and systemd warns when its host key is not itself on encrypted media.
+//! Interactive users without a hardware/keyring backend still type a
+//! passphrase. The vault contents remain Argon2id + AES-256-GCM encrypted at
+//! rest either way.
 
 use zeroize::Zeroizing;
 
@@ -26,6 +29,9 @@ pub mod tpm2;
 
 #[cfg(feature = "os-keyring")]
 pub mod os_keyring;
+
+#[cfg(target_os = "linux")]
+pub mod systemd_creds;
 
 /// Error type for HSM operations.
 #[derive(Debug, thiserror::Error)]
@@ -88,9 +94,28 @@ pub fn backend_named(name: &str) -> anyhow::Result<Box<dyn SecretBackend>> {
     match name {
         "tpm2" => tpm2_backend(),
         "keyring" => keyring_backend(),
+        "systemd-creds" => systemd_creds_backend(),
         other => {
-            anyhow::bail!("unknown backend '{other}' — expected one of: tpm2, keyring")
+            anyhow::bail!(
+                "unknown backend '{other}' — expected one of: tpm2, keyring, systemd-creds"
+            )
         }
+    }
+}
+
+fn systemd_creds_backend() -> anyhow::Result<Box<dyn SecretBackend>> {
+    #[cfg(target_os = "linux")]
+    {
+        if !systemd_creds::SystemdCredsBackend::is_available() {
+            anyhow::bail!(
+                "systemd-creds backend requested but unavailable — install systemd-creds and run as the service owner"
+            );
+        }
+        Ok(Box::new(systemd_creds::SystemdCredsBackend::new()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        anyhow::bail!("systemd-creds backend is Linux-only")
     }
 }
 
@@ -130,10 +155,9 @@ fn keyring_backend() -> anyhow::Result<Box<dyn SecretBackend>> {
 
 /// Auto-detect and return the highest available security tier backend.
 ///
-/// `software_key` is the vault's passphrase-derived key material, used only
-/// if no hardware/OS-keyring backend is available. If Tier-3 is reached and
-/// no key was supplied, this fails loudly rather than silently falling back
-/// to reading a master secret out of the process environment.
+/// Headless root services may fall back to host-bound systemd credentials;
+/// ordinary users still fail closed rather than reading a second master
+/// secret from the process environment.
 pub fn detect_backend() -> anyhow::Result<Box<dyn SecretBackend>> {
     #[cfg(all(feature = "tpm2", target_os = "linux"))]
     if tpm2::Tpm2Backend::is_available() {
@@ -145,6 +169,12 @@ pub fn detect_backend() -> anyhow::Result<Box<dyn SecretBackend>> {
     if os_keyring::OsKeyringBackend::is_available() {
         tracing::info!("HSM: using Tier-2 OS keyring backend");
         return Ok(Box::new(os_keyring::OsKeyringBackend::new()));
+    }
+
+    #[cfg(target_os = "linux")]
+    if systemd_creds::SystemdCredsBackend::is_available() {
+        tracing::info!("HSM: using Tier-2 systemd credential backend");
+        return Ok(Box::new(systemd_creds::SystemdCredsBackend::new()));
     }
 
     anyhow::bail!(

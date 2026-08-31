@@ -141,6 +141,11 @@ HEARTH_VAULT_ALLOW_NON_TTY=1
 ```
 init                    First-time setup: create the vault, set a passphrase,
                          print a one-time BIP39 recovery mnemonic.
+init-machine --recovery-recipient HV1_IDENTITY --recovery-output FILE
+                         Headless initialization: generate a random passphrase,
+                         seal it to the selected host backend, and write the
+                         recovery mnemonic only inside a recipient-encrypted
+                         `.hvs` bundle. No secret is printed.
 set <key>... [--tier] [--rotate-days N] [--expires WHEN]
                          Store one or more secrets (hidden-input prompt).
                          Tier defaults to 3 (use-only); an existing key keeps
@@ -268,8 +273,8 @@ prompt                  Print a passphrase prompt for session caching, e.g.
                          `export HEARTH_VAULT_PASSPHRASE=$(hearth-vault prompt)`.
                          Prefer `agent` + `unlock`: that env var is inherited
                          by every process you spawn, agents included.
-seal                    Seal the vault passphrase to TPM2 or the OS keyring
-                         for auto-unlock on this machine.
+seal                    Seal the vault passphrase to TPM2, the OS keyring, or
+                         root-owned systemd credentials for auto-unlock.
 shell-init [bash|zsh|fish]
                          Print a snippet for your shell rc file that defines
                          an `hv` wrapper (`hv npm run dev` runs the command
@@ -293,7 +298,7 @@ force one with `--backend`:
 
 | OS      | Tier 1 (default when available)      | Tier 2 fallback |
 |---------|---------------------------------------|------------------|
-| Linux   | TPM2 (opt-in `tpm2` build feature) or the Secret Service via the OS keyring (`os-keyring` feature, on by default) | software vault (Argon2id + AES-256-GCM) |
+| Linux   | TPM2 (opt-in `tpm2` build feature) or the Secret Service via the OS keyring (`os-keyring` feature, on by default) | `systemd-creds` host sealing for root-owned headless services; otherwise interactive software vault |
 | macOS   | Keychain (`os-keyring`)               | software vault |
 | Windows | Credential Manager (`os-keyring`)     | software vault |
 
@@ -303,6 +308,14 @@ appending `--features tpm2` to the install command above, on Linux where a
 TPM2 chip is present. The OS keyring needs no system packages: the
 Linux backend speaks D-Bus directly (zbus, pure Rust) rather than linking
 libsecret.
+
+For a headless Linux service running as root with neither TPM nor Secret
+Service, `--backend systemd-creds` uses `systemd-creds --with-key=host` to
+seal the vault passphrase. This is host-bound OS protection, not hardware
+protection: root compromise can recover it, and a host key on unencrypted
+media does not protect against full-disk acquisition. Use `init-machine` so
+the random passphrase is never printed and the recovery mnemonic is delivered
+only as a bundle encrypted to a separately held Hearth Vault identity.
 
 ### If the OS keyring hangs or gets skipped
 

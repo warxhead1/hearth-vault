@@ -18,6 +18,24 @@ you would rather not build. Not yet on crates.io.)
 prints a one-time 24-word BIP39 recovery mnemonic. Write it down — it is the
 only way back in if you forget the passphrase, and it is never shown again.
 
+### Headless Linux service
+
+On a root-owned server without TPM or Secret Service, initialize a distinct
+machine vault without putting a passphrase or recovery phrase in a terminal:
+
+```sh
+hearth-vault --backend systemd-creds init-machine \
+  --recovery-recipient hv1pub... \
+  --recovery-output /secure/recovery/machine-vault.hvs
+```
+
+The recipient is the public output of a separately controlled
+`hearth-vault identity`. Move the encrypted bundle off-host before adding
+credentials. The systemd backend is host-bound OS protection, not hardware:
+root compromise can decrypt it and full-disk protection depends on the host.
+Run services through `hearth-vault exec --redact`; do not export the vault
+passphrase or copy a workstation vault to the server.
+
 Store your first secret:
 
 ```sh

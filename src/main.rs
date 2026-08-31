@@ -31,7 +31,7 @@ struct Cli {
     vault_path: Option<PathBuf>,
 
     /// Secret backend to use for auto-unseal / seal instead of
-    /// auto-detection: tpm2, keyring, or software.
+    /// auto-detection: tpm2, keyring, or systemd-creds.
     #[arg(long, global = true, value_name = "BACKEND")]
     backend: Option<String>,
 
@@ -177,6 +177,18 @@ enum Commands {
     },
     /// Initialize the vault (first-time setup)
     Init,
+    /// Initialize a headless machine-local vault without printing a
+    /// passphrase or recovery phrase. The random passphrase is sealed to the
+    /// selected host backend; the recovery phrase is written only inside an
+    /// encrypted hearth-vault bundle addressed to an existing identity.
+    InitMachine {
+        /// Existing `hearth-vault identity` that alone can open the recovery bundle.
+        #[arg(long, value_name = "HV1_IDENTITY")]
+        recovery_recipient: String,
+        /// New encrypted `.hvs` bundle path. Refuses to overwrite.
+        #[arg(long, value_name = "PATH")]
+        recovery_output: PathBuf,
+    },
     /// Show vault status (backend type, path, permissions, rotations due)
     Status {
         /// Machine-readable output for monitoring.
@@ -676,12 +688,7 @@ fn resolve_vault_path(explicit: Option<&PathBuf>) -> anyhow::Result<PathBuf> {
     Ok(platform_path)
 }
 
-/// Resolve the secret backend for TPM2/keyring auto-unseal and `seal`.
-///
-/// Backends exist only to seal the vault passphrase for automatic unlock, so
-/// a machine with no hardware backend has no backend at all — that surfaces
-/// as a clear `Err` here (propagated via `?`, never unwrapped), and callers
-/// fall back to prompting for the passphrase.
+/// Resolve the secret backend for TPM2/keyring/systemd auto-unseal and `seal`.
 fn resolve_backend(
     name: Option<&str>,
 ) -> anyhow::Result<Box<dyn hearth_vault::hsm::SecretBackend>> {
@@ -702,9 +709,9 @@ fn sealed_passphrase_path(vault_path: &Path) -> PathBuf {
 /// Open the vault with the best available method.
 ///
 /// Priority:
-/// 1. Hardware-backed auto-unseal (sealed blob next to the vault file,
-///    unsealed via TPM2/keyring — skipped entirely if no such backend is
-///    available or nothing was ever sealed).
+/// 1. Host-protected auto-unseal (sealed blob next to the vault file,
+///    unsealed via TPM2/keyring/systemd-creds — skipped entirely if no such
+///    backend is available or nothing was ever sealed).
 /// 2. HEARTH_VAULT_PASSPHRASE env var (session caching / SSH / tmux)
 /// 3. Interactive prompt via rpassword
 fn open_vault(vault_path: PathBuf, backend_name: Option<&str>) -> anyhow::Result<VaultStore> {
@@ -829,6 +836,10 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Init => cmd_init(vault_path)?,
+        Commands::InitMachine {
+            recovery_recipient,
+            recovery_output,
+        } => cmd_init_machine(vault_path, backend, &recovery_recipient, &recovery_output)?,
         Commands::Set {
             keys,
             tier,
@@ -983,6 +994,92 @@ fn cmd_init(vault_path: PathBuf) -> anyhow::Result<()> {
     let mut buf = String::new();
     std::io::stdin().read_line(&mut buf)?;
 
+    Ok(())
+}
+
+fn cmd_init_machine(
+    vault_path: PathBuf,
+    backend: Option<&str>,
+    recovery_recipient: &str,
+    recovery_output: &Path,
+) -> anyhow::Result<()> {
+    if vault_path.exists() {
+        anyhow::bail!("vault already exists at {}", vault_path.display());
+    }
+    if recovery_output.exists() {
+        anyhow::bail!(
+            "recovery output already exists at {}; refusing to overwrite",
+            recovery_output.display()
+        );
+    }
+
+    let hsm = resolve_backend(backend)?;
+    if hsm.tier() > 2 {
+        anyhow::bail!(
+            "headless initialization requires a host-protected backend, got {} (tier {})",
+            hsm.name(),
+            hsm.tier()
+        );
+    }
+    if let Some(parent) = vault_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = recovery_output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let random: [u8; 32] = hearth_vault::crypto::random_bytes();
+    let passphrase = Zeroizing::new(
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    );
+    let sealed_path = sealed_passphrase_path(&vault_path);
+
+    let result = (|| -> anyhow::Result<()> {
+        let mut store = VaultStore::open_at_with_passphrase(vault_path.clone(), &passphrase)?;
+        let mnemonic = store.generate_recovery_key()?;
+        store.save()?;
+
+        let sealed_blob = hsm
+            .seal(passphrase.as_bytes(), "hearth-vault")
+            .map_err(|e| anyhow::anyhow!("seal failed: {e}"))?;
+        platform::write_private(&sealed_path, &sealed_blob)?;
+
+        let recovery_entry = vec![(
+            "machine/recovery-mnemonic".to_string(),
+            SensitiveString::new(mnemonic.to_string()),
+            TIER_USE_ONLY,
+        )];
+        let bundle = hearth_vault::share::seal(
+            &recovery_entry,
+            recovery_recipient,
+            Some(TIER_USE_ONLY),
+            Some("headless machine vault recovery; store separately from the host".to_string()),
+        )?;
+        let bundle_json = serde_json::to_vec_pretty(&bundle)?;
+        platform::write_private(recovery_output, &bundle_json)?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let _ = fs::remove_file(&vault_path);
+        let _ = fs::remove_file(&sealed_path);
+        let _ = fs::remove_file(recovery_output);
+        return Err(error);
+    }
+
+    eprintln!("Machine vault initialized at {}.", vault_path.display());
+    eprintln!(
+        "Passphrase sealed through {} (tier {}); no secret value was printed.",
+        hsm.name(),
+        hsm.tier()
+    );
+    eprintln!(
+        "Encrypted recovery bundle written to {}; move it off-host before adding credentials.",
+        recovery_output.display()
+    );
     Ok(())
 }
 
@@ -1670,10 +1767,10 @@ fn cmd_seal(vault_path: PathBuf, backend: Option<&str>) -> anyhow::Result<()> {
 
     if hsm.tier() > 2 {
         anyhow::bail!(
-            "No hardware-backed backend available (need TPM2 or an OS keyring, tier <= 2).\n\
+            "No host-protected backend available (need TPM2, an OS keyring, or root-owned systemd-creds; tier <= 2).\n\
              Current backend: {} (tier {})\n\
-             Ensure TPM2 is accessible (/dev/tpmrm0) or an OS keyring daemon is running, or pass \
-             --backend explicitly if more than one is available.",
+             Ensure TPM2 is accessible (/dev/tpmrm0), an OS keyring daemon is running, or use \
+             --backend systemd-creds for a headless Linux root service.",
             hsm.name(),
             hsm.tier()
         );
@@ -1686,15 +1783,14 @@ fn cmd_seal(vault_path: PathBuf, backend: Option<&str>) -> anyhow::Result<()> {
     let _store = VaultStore::open_at_with_passphrase(vault_path.clone(), &passphrase)?;
     eprintln!("Passphrase verified against vault.");
 
-    // Seal passphrase to TPM2/keyring
+    // Seal passphrase to the selected host-protected backend.
     let sealed_blob = hsm
         .seal(passphrase.as_bytes(), "hearth-vault")
         .map_err(|e| anyhow::anyhow!("seal failed: {e}"))?;
 
     // Write sealed blob to disk
     let sealed_path = sealed_passphrase_path(&vault_path);
-    fs::write(&sealed_path, &sealed_blob)?;
-    platform::restrict_to_owner(&sealed_path)?;
+    platform::write_private(&sealed_path, &sealed_blob)?;
 
     eprintln!("Passphrase sealed to {} (tier {}).", hsm.name(), hsm.tier());
     eprintln!("Sealed blob: {}", sealed_path.display());
@@ -2337,9 +2433,8 @@ fn cmd_status(vault_path: PathBuf, backend: Option<&str>, json: bool) -> anyhow:
     match resolve_backend(backend) {
         Ok(hsm) => println!("HSM backend: {} (tier {})", hsm.name(), hsm.tier()),
         Err(e) => println!(
-            "HSM backend: unavailable for inspection ({e}). Hardware-backed backends need a \
-             TPM2 or an OS keyring; the software backend needs vault-passphrase-derived key \
-             material this command doesn't have without unlocking first."
+            "HSM backend: unavailable for inspection ({e}). Use TPM2 or an OS keyring for \
+             interactive users; a headless Linux root service may use systemd-creds."
         ),
     }
 
