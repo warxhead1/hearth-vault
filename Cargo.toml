@@ -42,23 +42,23 @@ os-keyring = ["dep:keyring"]
 github-app-token = ["dep:reqwest"]
 
 [dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 # Streaming, multi-pattern, longest-match-wins search for `exec --redact`'s
 # output scrubber. Already a transitive dependency (via `regex`), so this
 # adds no new supply-chain surface -- just a direct edge on a crate already
 # in the tree.
 aho-corasick = "1"
 anyhow = "1"
-argon2 = "0.5"
-base64 = "0.22"
+argon2 = "0.6"
+base64 = "0.23"
 bip39 = "2"
 blake3 = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive"] }
 directories = "6"
-hkdf = "0.12"
-pem-rfc7468 = { version = "0.7", features = ["alloc"] }
-rand = "0.8"
+hkdf = "0.13"
+pem-rfc7468 = { version = "1.0", features = ["alloc"] }
+rand = "0.10"
 regex = "1"
 reqwest = { version = "0.12", optional = true, default-features = false, features = [
     "blocking",
@@ -69,13 +69,13 @@ ring = "0.17"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha3 = "0.10"
+sha3 = "0.12"
 thiserror = "2"
 tracing = "0.1"
 # Team sharing only: X25519 to seal a bundle of entries to a teammate's vault
 # identity. `static_secrets` lets us rebuild a stable secret from the data key,
 # so sharing adds no second private key for a user to store, back up, or lose.
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 zeroize = { version = "1", features = ["derive", "zeroize_derive"] }
 
 tss-esapi = { version = "7.6", optional = true }
@@ -104,7 +104,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3.6", optional = true, features = ["windows-native"] }
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
