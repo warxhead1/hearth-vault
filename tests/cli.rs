@@ -1260,6 +1260,11 @@ fn exec_without_a_discoverable_prefix_explains_the_options() {
 /// developer/agent session, can include real API keys the session holds
 /// for unrelated tools. `current_exe()` is an absolute path, so no `PATH`
 /// lookup is needed to spawn it.
+///
+/// Only used by the `exec --warn-unsealed` and `seal-check` tests below,
+/// which are themselves `#[cfg(target_os = "linux")]` (the seal probe needs
+/// `/proc`) — gated the same way so a non-Linux build doesn't dead-code-warn.
+#[cfg(target_os = "linux")]
 fn spawn_helper_child(extra_env: &[(&str, &str)]) -> std::process::Child {
     let helper = std::env::current_exe().expect("path to this test binary");
     let mut cmd = std::process::Command::new(&helper);
