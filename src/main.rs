@@ -3348,6 +3348,39 @@ fn vault_candidate_env_names(
     names
 }
 
+/// Probe a process's seal status, retrying briefly while the answer is
+/// inconclusive.
+///
+/// `Unknown` does not mean "no such process" — it also covers "the process
+/// exists but has not materialized in /proc yet", which is routine on a
+/// loaded host in the moments after a spawn. Accepting the first Unknown as
+/// final made `seal-check --pid <just-spawned>` report an exposed process as
+/// UNKNOWN and exit 0: MEASURED 2026-09-04, the test asserting exit 1 for a
+/// readable child passed alone (6.1s) and failed inside the full parallel
+/// suite.
+///
+/// Only used for targets the caller named explicitly (`--pid`/`--unit`),
+/// where the caller is asserting the process exists. `--all` enumerates
+/// whatever is alive right now and a vanished pid there is ordinary.
+///
+/// Bounded at half a second so a genuinely dead pid costs almost nothing.
+fn probe_seal_status_settled(pid: u32) -> hearth_vault::hsm::platform::ProcSealStatus {
+    use hearth_vault::hsm::platform::{ProcSealStatus, probe_seal_status};
+
+    const ATTEMPTS: u32 = 20;
+    const INTERVAL_MS: u64 = 25;
+
+    let mut last = probe_seal_status(pid);
+    for _ in 1..ATTEMPTS {
+        if !matches!(last, ProcSealStatus::Unknown(_)) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(INTERVAL_MS));
+        last = probe_seal_status(pid);
+    }
+    last
+}
+
 fn cmd_seal_check(
     vault_path: PathBuf,
     backend: Option<&str>,
@@ -3393,7 +3426,16 @@ fn cmd_seal_check(
     let mut probes = Vec::with_capacity(targets.len());
     for (target_pid, label) in targets {
         let label = label.or_else(|| hearth_vault::hsm::platform::read_proc_comm(target_pid));
-        match hearth_vault::hsm::platform::probe_seal_status(target_pid) {
+        // An explicitly named target is asserted by the caller to exist, so
+        // an inconclusive first probe is a race to wait out, not an answer.
+        // `--all` takes the instantaneous reading: a pid that vanished
+        // mid-sweep is ordinary, not a finding.
+        let probed = if all {
+            hearth_vault::hsm::platform::probe_seal_status(target_pid)
+        } else {
+            probe_seal_status_settled(target_pid)
+        };
+        match probed {
             hearth_vault::hsm::platform::ProcSealStatus::Sealed => probes.push(ProbeResult {
                 pid: target_pid,
                 label,
