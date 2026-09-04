@@ -356,44 +356,66 @@ pub fn own_uid() -> u32 {
 /// Never reads `environ`/`mem`/`maps` of anything it enumerates; a process
 /// that vanishes mid-scan (exited, or a status line in an unexpected shape)
 /// is silently skipped rather than failing the whole sweep.
-#[cfg(target_os = "linux")]
+///
+/// Always compiles (like `probe_seal_status`), so a caller doesn't need its
+/// own `#[cfg(target_os = "linux")]` just to reach this — on a non-Linux
+/// target it returns an explicit `Unsupported` error rather than an empty
+/// (and misleadingly "nothing found") list.
 pub fn list_own_pids() -> std::io::Result<Vec<u32>> {
-    let self_uid = own_uid();
-    let mut pids = Vec::new();
-    for entry in std::fs::read_dir("/proc")? {
-        let Ok(entry) = entry else { continue };
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
-            continue;
-        };
-        let Some(uid_line) = status.lines().find(|l| l.starts_with("Uid:")) else {
-            continue;
-        };
-        let real_uid = uid_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse::<u32>().ok());
-        if real_uid == Some(self_uid) {
-            pids.push(pid);
+    #[cfg(target_os = "linux")]
+    {
+        let self_uid = own_uid();
+        let mut pids = Vec::new();
+        for entry in std::fs::read_dir("/proc")? {
+            let Ok(entry) = entry else { continue };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+                continue;
+            };
+            let Some(uid_line) = status.lines().find(|l| l.starts_with("Uid:")) else {
+                continue;
+            };
+            let real_uid = uid_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u32>().ok());
+            if real_uid == Some(self_uid) {
+                pids.push(pid);
+            }
         }
+        Ok(pids)
     }
-    Ok(pids)
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "process enumeration needs /proc, which only exists on Linux",
+        ))
+    }
 }
 
 /// The short executable name from `/proc/<pid>/comm` — non-secret process
 /// metadata (like argv), used only to make a `seal-check --all` report
-/// readable. `None` if the process is gone or `/proc` is unavailable.
-#[cfg(target_os = "linux")]
+/// readable. `None` if the process is gone, `/proc` is unavailable, or this
+/// isn't Linux — always compiles, same reasoning as `list_own_pids`.
 pub fn read_proc_comm(pid: u32) -> Option<String> {
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .ok()
-        .map(|s| s.trim().to_string())
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// Best-effort probe of `pid`'s seal state. Linux-only: `/proc` is a Linux
@@ -444,20 +466,36 @@ pub fn probe_seal_status(pid: u32) -> ProcSealStatus {
 /// and never stored, returned, printed, or compared. This is the primitive
 /// `seal-check` uses to report "these vault-managed NAMES are exposed"
 /// without a value ever leaving this function.
-#[cfg(target_os = "linux")]
+/// Environment variable NAMES (never values) of a process, read from
+/// `/proc/<pid>/environ`. Callers use this only against processes already
+/// confirmed `ProcSealStatus::Readable` — this function itself does not
+/// re-check that, it just parses whatever `/proc` hands back. Always
+/// compiles (same reasoning as `list_own_pids`); on non-Linux it returns an
+/// explicit `Unsupported` error rather than silently claiming "no names".
 pub fn read_proc_env_names(pid: u32) -> std::io::Result<Vec<String>> {
-    let raw = std::fs::read(format!("/proc/{pid}/environ"))?;
-    Ok(raw
-        .split(|b| *b == 0)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| {
-            let name_bytes = match entry.iter().position(|b| *b == b'=') {
-                Some(idx) => &entry[..idx],
-                None => entry,
-            };
-            String::from_utf8_lossy(name_bytes).into_owned()
-        })
-        .collect())
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read(format!("/proc/{pid}/environ"))?;
+        Ok(raw
+            .split(|b| *b == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                let name_bytes = match entry.iter().position(|b| *b == b'=') {
+                    Some(idx) => &entry[..idx],
+                    None => entry,
+                };
+                String::from_utf8_lossy(name_bytes).into_owned()
+            })
+            .collect())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "reading environ names needs /proc, which only exists on Linux",
+        ))
+    }
 }
 
 /// True if stdout is a terminal. Backs the CLI's non-TTY refusal rule for
