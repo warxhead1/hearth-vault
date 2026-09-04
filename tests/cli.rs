@@ -45,11 +45,27 @@ const TEST_PASSPHRASE: &str = "cli-test-fixture-passphrase-not-a-real-secret";
 /// this is a no-op that trivially passes.
 #[test]
 fn helper_print_env() {
+    // Opt-in self-sealing, exercised by the `--warn-unsealed` tests below:
+    // this must run BEFORE anything else so the child's window of exposure
+    // matches what a real self-sealing consumer would do (seal first thing
+    // in main(), before touching the injected secret).
+    if std::env::var("HV_TEST_SEAL_SELF").is_ok() {
+        hearth_vault::hsm::platform::disable_core_dumps();
+    }
     if let Ok(var_name) = std::env::var("HV_TEST_ECHO_VAR") {
         let value = std::env::var(&var_name).unwrap_or_default();
         // Distinctive markers so the parent test can find this exact line
         // among libtest's own "running 1 test" / "test ... ok" chatter.
         println!("HV_ECHO_BEGIN:{value}:HV_ECHO_END");
+    }
+    // `--warn-unsealed`'s poll window is up to ~2s of 50ms probes (see
+    // `poll_seal_and_warn` in src/main.rs for why it's that generous); this
+    // must outlast the full window so a still-`Readable` child survives
+    // long enough for the warning's LAST probe to actually fire, and so a
+    // slow-to-seal child (under parallel-test scheduler contention) is
+    // still alive when a later probe catches it sealed.
+    if std::env::var("HV_TEST_HOLD_OPEN").is_ok() {
+        std::thread::sleep(std::time::Duration::from_millis(2500));
     }
 }
 
@@ -509,6 +525,95 @@ fn exec_redact_env_var_is_equivalent_to_the_flag() {
     assert!(
         !stdout.contains(secret_value),
         "raw secret leaked despite HEARTH_VAULT_REDACT=1:\n{stdout}"
+    );
+}
+
+// ── --warn-unsealed: observing whether the CHILD sealed itself ─────────
+//
+// Linux-only (like the underlying `/proc` probe itself — see
+// `hsm::platform::probe_seal_status`): on macOS/Windows there is no
+// portable equivalent to check from outside the process, so
+// `--warn-unsealed` is a documented no-op there and these two tests would
+// otherwise assert behavior the feature deliberately does not provide.
+
+/// The core claim: a plain child (no self-sealing) still gets its secrets
+/// injected exactly as before, AND now also earns a stderr warning naming
+/// the exposure risk — the exact mechanism (`ps eww` / `/proc/<pid>/environ`
+/// readable to any same-UID process) behind the 2026-09-04 incident this
+/// flag exists to surface.
+#[test]
+#[cfg(target_os = "linux")]
+fn exec_warn_unsealed_warns_about_an_unsealed_child() {
+    let fx = VaultFixture::new();
+    let secret_value = "warn-unsealed-fixture-value-unsealed"; // hearth-vault:allow (test fixture, not a credential)
+
+    fx.cmd()
+        .args(["set", "myapp/api-key", "--tier", "3"])
+        .write_stdin(format!("{secret_value}\n"))
+        .assert()
+        .success();
+
+    let helper = std::env::current_exe().expect("path to this test binary");
+
+    let assert = fx
+        .cmd()
+        .env("HV_TEST_ECHO_VAR", "API_KEY")
+        .env("HV_TEST_HOLD_OPEN", "1")
+        .args(["exec", "--prefix", "myapp/", "--warn-unsealed", "--"])
+        .arg(&helper)
+        .args(["helper_print_env", "--exact", "--nocapture"])
+        .assert()
+        .success();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("has not sealed") && stderr.contains("PR_SET_DUMPABLE"),
+        "expected an unsealed-child warning on stderr, got:\n{stderr}"
+    );
+
+    // The value itself is never touched by this feature — still passes
+    // through exactly like plain `exec` would.
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let marker = format!("HV_ECHO_BEGIN:{secret_value}:HV_ECHO_END");
+    assert!(
+        stdout.contains(&marker),
+        "expected the injected value to still pass through unchanged:\n{stdout}"
+    );
+}
+
+/// The negative case: a child that calls `disable_core_dumps()` (the same
+/// primitive `hearth-vault` itself calls at startup) on entry gets NO
+/// warning — this is the "consumer did the right thing" path, and a false
+/// positive here would train operators to ignore the warning.
+#[test]
+#[cfg(target_os = "linux")]
+fn exec_warn_unsealed_is_silent_for_a_self_sealed_child() {
+    let fx = VaultFixture::new();
+    let secret_value = "warn-unsealed-fixture-value-sealed"; // hearth-vault:allow (test fixture, not a credential)
+
+    fx.cmd()
+        .args(["set", "myapp/api-key", "--tier", "3"])
+        .write_stdin(format!("{secret_value}\n"))
+        .assert()
+        .success();
+
+    let helper = std::env::current_exe().expect("path to this test binary");
+
+    let assert = fx
+        .cmd()
+        .env("HV_TEST_ECHO_VAR", "API_KEY")
+        .env("HV_TEST_SEAL_SELF", "1")
+        .env("HV_TEST_HOLD_OPEN", "1")
+        .args(["exec", "--prefix", "myapp/", "--warn-unsealed", "--"])
+        .arg(&helper)
+        .args(["helper_print_env", "--exact", "--nocapture"])
+        .assert()
+        .success();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        !stderr.contains("has not sealed"),
+        "a self-sealed child must not trigger the unsealed warning:\n{stderr}"
     );
 }
 
@@ -1132,4 +1237,249 @@ fn exec_without_a_discoverable_prefix_explains_the_options() {
                 .and(predicate::str::contains("HEARTH_VAULT_PREFIX"))
                 .and(predicate::str::contains(".hearth-vault")),
         );
+}
+
+// ── seal-check: auditing an already-running process ─────────────────────
+//
+// Linux-only, same reason as the `--warn-unsealed` tests above: the
+// underlying probe needs `/proc`.
+
+/// Spawn this test binary's `helper_print_env` re-invocation as a
+/// stand-in "already-running consumer" for `seal-check` to audit, with a
+/// FULLY CLEARED environment (`env_clear()`) plus only the `extra_env`
+/// pairs the caller asks for.
+///
+/// This is deliberate and load-bearing, not incidental hygiene: a plain
+/// `Command::new` without `env_clear()` inherits the calling test
+/// process's entire ambient environment — which, in an interactive
+/// developer/agent session, can include real API keys the session holds
+/// for unrelated tools. `current_exe()` is an absolute path, so no `PATH`
+/// lookup is needed to spawn it.
+fn spawn_helper_child(extra_env: &[(&str, &str)]) -> std::process::Child {
+    let helper = std::env::current_exe().expect("path to this test binary");
+    let mut cmd = std::process::Command::new(&helper);
+    cmd.env_clear()
+        .args(["helper_print_env", "--exact", "--nocapture"])
+        .stdout(std::process::Stdio::null());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.spawn().expect("spawn hermetic helper child")
+}
+
+/// A plain (unsealed) process holding an env var whose NAME matches what
+/// this vault would generate for one of its keys is reported READABLE with
+/// that name flagged, and the command exits non-zero — the actionable
+/// finding this whole feature exists to produce.
+#[test]
+#[cfg(target_os = "linux")]
+fn seal_check_pid_flags_a_vault_managed_name_on_an_unsealed_process() {
+    let fx = VaultFixture::new();
+    let secret_value = "seal-check-fixture-value-in-vault"; // hearth-vault:allow (test fixture, not a credential)
+
+    fx.cmd()
+        .args(["set", "myapp/api-key", "--tier", "3"])
+        .write_stdin(format!("{secret_value}\n"))
+        .assert()
+        .success();
+
+    // Deliberately NOT launched via `hearth-vault exec` — this is a
+    // stand-in for an already-running consumer `seal-check` audits after
+    // the fact. The value here is a distinct fixture, never the vault's own
+    // value; only the NAME `API_KEY` needs to match. Hermetic (`env_clear`)
+    // so this can never touch the test session's own ambient environment.
+    let mut child = spawn_helper_child(&[
+        (
+            "API_KEY",
+            "child-side-fixture-value-not-vault-derived", // hearth-vault:allow (test fixture, not a credential)
+        ),
+        ("HV_TEST_HOLD_OPEN", "1"),
+    ]);
+    let pid = child.id();
+
+    let assert = fx
+        .cmd()
+        .args(["seal-check", "--pid", &pid.to_string()])
+        .assert()
+        .code(1);
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        stdout.contains("READABLE") && stdout.contains("API_KEY"),
+        "expected a READABLE finding naming API_KEY, got:\n{stdout}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The negative case for the SAME scenario: a process that seals itself
+/// (`disable_core_dumps()`, same primitive `hearth-vault` calls on itself)
+/// is reported SEALED and the command exits 0 — the "consumer did the
+/// right thing" path.
+#[test]
+#[cfg(target_os = "linux")]
+fn seal_check_pid_reports_sealed_for_a_self_sealed_process() {
+    let fx = VaultFixture::new();
+    let secret_value = "seal-check-fixture-value-sealed"; // hearth-vault:allow (test fixture, not a credential)
+
+    fx.cmd()
+        .args(["set", "myapp/api-key", "--tier", "3"])
+        .write_stdin(format!("{secret_value}\n"))
+        .assert()
+        .success();
+
+    let mut child = spawn_helper_child(&[
+        (
+            "API_KEY",
+            "child-side-fixture-value-sealed", // hearth-vault:allow (test fixture, not a credential)
+        ),
+        ("HV_TEST_SEAL_SELF", "1"),
+        ("HV_TEST_HOLD_OPEN", "1"),
+    ]);
+    let pid = child.id();
+
+    let assert = fx
+        .cmd()
+        .args(["seal-check", "--pid", &pid.to_string()])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        stdout.contains("SEALED"),
+        "expected a SEALED finding, got:\n{stdout}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A READABLE process whose env var names don't overlap the vault at all
+/// is reported as such but does NOT fail the command — only a confirmed
+/// name match is treated as a finding, never bare readability alone (an
+/// unsealed `bash` or `sleep` is not itself news).
+#[test]
+#[cfg(target_os = "linux")]
+fn seal_check_pid_readable_without_a_vault_match_exits_zero() {
+    let fx = VaultFixture::new();
+    let secret_value = "seal-check-fixture-value-unrelated"; // hearth-vault:allow (test fixture, not a credential)
+
+    fx.cmd()
+        .args(["set", "myapp/other-key", "--tier", "3"])
+        .write_stdin(format!("{secret_value}\n"))
+        .assert()
+        .success();
+
+    let mut child = spawn_helper_child(&[
+        ("SOME_UNRELATED_VAR", "not-a-vault-name"),
+        ("HV_TEST_HOLD_OPEN", "1"),
+    ]);
+    let pid = child.id();
+
+    let assert = fx
+        .cmd()
+        .args(["seal-check", "--pid", &pid.to_string()])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        stdout.contains("READABLE"),
+        "expected a READABLE finding, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("OTHER_KEY"),
+        "must not flag a vault key whose name the child never exposed:\n{stdout}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `--json` never changes WHAT is reported — same names-only contract —
+/// only the format. Parsed structurally rather than string-matched, so a
+/// future field addition doesn't silently break this test.
+#[test]
+#[cfg(target_os = "linux")]
+fn seal_check_json_reports_structured_fields_names_only() {
+    let fx = VaultFixture::new();
+    let secret_value = "seal-check-fixture-value-json"; // hearth-vault:allow (test fixture, not a credential)
+
+    fx.cmd()
+        .args(["set", "myapp/api-key", "--tier", "3"])
+        .write_stdin(format!("{secret_value}\n"))
+        .assert()
+        .success();
+
+    let mut child = spawn_helper_child(&[
+        (
+            "API_KEY",
+            "child-side-fixture-value-json", // hearth-vault:allow (test fixture, not a credential)
+        ),
+        ("HV_TEST_HOLD_OPEN", "1"),
+    ]);
+    let pid = child.id();
+
+    let assert = fx
+        .cmd()
+        .args(["seal-check", "--pid", &pid.to_string(), "--json"])
+        .assert()
+        .code(1);
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let rows: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON output");
+    let rows = rows.as_array().expect("top-level JSON array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["pid"], pid);
+    assert_eq!(rows[0]["status"], "readable");
+    assert_eq!(rows[0]["exposed_vault_names"][0], "API_KEY");
+
+    // Never a value: the fixture's secret string must not appear anywhere
+    // in the JSON output, structurally or otherwise.
+    assert!(!stdout.contains(secret_value));
+    assert!(!stdout.contains("child-side-fixture-value-json"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A vault that cannot be opened (wrong passphrase here) does not stop
+/// seal status from being reported — it degrades to seal-status-only and
+/// says so, rather than silently claiming a clean name-overlap result it
+/// never actually checked.
+#[test]
+#[cfg(target_os = "linux")]
+fn seal_check_reports_seal_status_even_when_the_vault_cannot_be_opened() {
+    let fx = VaultFixture::new();
+
+    fx.cmd()
+        .args(["set", "myapp/api-key", "--tier", "3"])
+        .write_stdin("seal-check-fixture-value-locked\n") // hearth-vault:allow (test fixture, not a credential)
+        .assert()
+        .success();
+
+    let mut child = spawn_helper_child(&[("HV_TEST_HOLD_OPEN", "1")]);
+    let pid = child.id();
+
+    let assert = fx
+        .cmd()
+        .env("HEARTH_VAULT_PASSPHRASE", "definitely-the-wrong-passphrase")
+        .args(["seal-check", "--pid", &pid.to_string()])
+        .assert()
+        .success();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("vault not opened") && stderr.contains("skipped"),
+        "expected an explicit degraded-mode note, got:\n{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        stdout.contains("READABLE"),
+        "seal status must still be reported without the vault:\n{stdout}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
