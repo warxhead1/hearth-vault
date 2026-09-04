@@ -285,6 +285,34 @@ enum Commands {
         /// `exec` still gives an unmodified TTY passthrough.
         #[arg(long)]
         redact: bool,
+        /// After injecting secrets and starting the child, check whether the
+        /// child has sealed its OWN `/proc/<pid>/environ` (closed it to
+        /// other same-UID readers) and print a stderr warning naming the
+        /// risk if it has not.
+        ///
+        /// OFF BY DEFAULT — equivalent env var: HEARTH_VAULT_WARN_UNSEALED=1.
+        /// hearth-vault CANNOT seal the child for it: `PR_SET_DUMPABLE` does
+        /// not survive `execve` (measured — the kernel resets it), so a
+        /// parent calling it before exec buys the child nothing. Only the
+        /// child calling it again, itself, after its own exec, actually
+        /// closes `/proc/<pid>/{environ,mem,maps}` to another process
+        /// running as you — including an AI coding agent that reads
+        /// `/proc/<pid>/environ` directly, the exact mechanism behind the
+        /// 2026-09-04 credential leak this flag exists to surface. See
+        /// README.md "Sealing a secret-holding process" for a
+        /// copy-pasteable snippet per language, and `hearth-vault
+        /// seal-check` to audit an already-running process or systemd unit
+        /// on demand instead of only at `exec` time.
+        ///
+        /// Same reason this is opt-in as `--redact`: turning it on switches
+        /// from `exec()` process-image replacement to spawn+wait so the
+        /// child can be observed after it starts, which is a real (if
+        /// usually invisible) change in signal-passthrough semantics that
+        /// must never surprise an existing consumer that didn't ask for it.
+        /// Never fatal — a hard failure here would break every consumer
+        /// that hasn't sealed itself yet, which today is nearly all of them.
+        #[arg(long)]
+        warn_unsealed: bool,
         /// Command and arguments to run (everything after `--`)
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -549,6 +577,47 @@ enum Commands {
     /// marker file, walking up from the current directory. Used by the
     /// `hv` wrapper `shell-init` generates.
     ProjectPrefix,
+    /// Audit whether a running process has sealed its own `/proc` environ
+    /// from other same-UID readers — the standalone counterpart to `exec
+    /// --warn-unsealed` for a process that's already running (a systemd
+    /// unit, a long-lived daemon you didn't launch via `exec` yourself).
+    ///
+    /// For each targeted process, reports SEALED or READABLE. When the
+    /// vault can be opened, a READABLE process is additionally checked for
+    /// whether any of its exposed environment variable NAMES match a name
+    /// this vault would generate for one of its keys — never a value, only
+    /// a name, so this is safe to run and safe to script against.
+    ///
+    /// Exit code is 1 if any READABLE process is holding a vault-managed
+    /// NAME (a real, actionable finding — wire this into a periodic check
+    /// or CI), 0 otherwise. If the vault cannot be opened, the name-overlap
+    /// check is skipped (noted on stderr) but seal status is still reported.
+    ///
+    /// Linux-only: the underlying probe needs `/proc`, which does not exist
+    /// on macOS/Windows.
+    ///
+    /// Example: hearth-vault seal-check --unit tachyonac.service
+    /// Example: hearth-vault seal-check --all --prefix myapp/
+    SealCheck {
+        /// Check exactly this process ID.
+        #[arg(long, value_name = "PID", conflicts_with_all = ["unit", "all"])]
+        pid: Option<u32>,
+        /// Resolve the PID from a systemd --user unit's MainPID
+        /// (`systemctl --user show -p MainPID --value <unit>`).
+        #[arg(long, value_name = "UNIT", conflicts_with_all = ["pid", "all"])]
+        unit: Option<String>,
+        /// Sweep every process currently running as you.
+        #[arg(long, conflicts_with_all = ["pid", "unit"])]
+        all: bool,
+        /// Only compare exposed names against vault keys under this prefix
+        /// (default: every key in the vault).
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Emit machine-readable JSON instead of a human-readable report.
+        /// Still names only — never a value, at any verbosity.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -875,8 +944,9 @@ fn main() -> anyhow::Result<()> {
         Commands::Exec {
             prefix,
             redact,
+            warn_unsealed,
             command,
-        } => cmd_exec(vault_path, backend, prefix, redact, &command)?,
+        } => cmd_exec(vault_path, backend, prefix, redact, warn_unsealed, &command)?,
         Commands::Sign {
             key,
             algorithm,
@@ -901,6 +971,13 @@ fn main() -> anyhow::Result<()> {
         )?,
         Commands::ShellInit { shell } => cmd_shell_init(shell),
         Commands::ProjectPrefix => cmd_project_prefix()?,
+        Commands::SealCheck {
+            pid,
+            unit,
+            all,
+            prefix,
+            json,
+        } => cmd_seal_check(vault_path, backend, pid, unit, all, prefix, json)?,
         Commands::InstallHook { path, force } => cmd_install_hook(path, force)?,
         Commands::DirenvInit => cmd_direnv_init(),
         Commands::Agent {
@@ -1969,11 +2046,70 @@ fn redact_requested(flag: bool) -> bool {
     flag || std::env::var("HEARTH_VAULT_REDACT").is_ok_and(|v| v != "0" && !v.is_empty())
 }
 
+/// True when `exec` should check whether the child sealed itself: either
+/// `--warn-unsealed` was passed, or `HEARTH_VAULT_WARN_UNSEALED` is set
+/// (same convention as `redact_requested`).
+fn warn_unsealed_requested(flag: bool) -> bool {
+    flag || std::env::var("HEARTH_VAULT_WARN_UNSEALED").is_ok_and(|v| v != "0" && !v.is_empty())
+}
+
+/// Poll a just-started child's `/proc/<pid>/environ` seal state and print a
+/// stderr warning if it is still readable to a same-UID process once the
+/// (short, bounded) grace window for a self-sealing consumer to call its own
+/// `prctl(PR_SET_DUMPABLE, 0)` has passed.
+///
+/// The window is generous (up to ~2s) rather than the handful of
+/// milliseconds a seal call actually takes on an idle machine: a freshly
+/// `fork+exec`'d process is not guaranteed the CPU immediately, and under
+/// scheduler contention (measured: this exact race under a fully parallel
+/// `cargo test` run misclassified a self-sealing test child as unsealed at
+/// a 100ms window) a child can take real wall-clock time just to reach the
+/// first line of its own `main()`. Paid only while the child stays
+/// `Readable` — a child that seals promptly (the common case on an
+/// otherwise-idle host) returns on the very first check.
+///
+/// Best-effort and non-fatal by construction: `ProcSealStatus::Unknown`
+/// (non-Linux, or the process already exited) is treated as "nothing to
+/// say," never as a warning or an error — see the `Exec::warn_unsealed` doc
+/// comment for why a hard failure here would be actively harmful (breaking
+/// every consumer that hasn't adopted sealing yet, which today is nearly all
+/// of them).
+fn poll_seal_and_warn(pid: u32, program: &str) {
+    use hearth_vault::hsm::platform::{ProcSealStatus, probe_seal_status};
+
+    const ATTEMPTS: u32 = 40;
+    const INTERVAL_MS: u64 = 50;
+
+    for attempt in 0..ATTEMPTS {
+        match probe_seal_status(pid) {
+            ProcSealStatus::Sealed => return,
+            ProcSealStatus::Unknown(_) => return,
+            ProcSealStatus::Readable if attempt + 1 == ATTEMPTS => {
+                eprintln!(
+                    "warning: `{program}` (pid {pid}) has not sealed /proc/{pid}/environ — the \
+                     secret(s) just injected into its environment are readable by ANY OTHER \
+                     process running as you (e.g. `ps eww -p {pid}`, `cat \
+                     /proc/{pid}/environ`, an AI coding agent's shell tool reading /proc \
+                     directly). This is not a hearth-vault bug: `PR_SET_DUMPABLE` does not \
+                     survive execve, so only `{program}` itself can close this. See \
+                     README.md \"Sealing a secret-holding process\" for a copy-pasteable \
+                     snippet (Go/Rust/C/Python), or `hearth-vault seal-check --pid {pid}` to \
+                     re-check later."
+                );
+            }
+            ProcSealStatus::Readable => {
+                std::thread::sleep(std::time::Duration::from_millis(INTERVAL_MS));
+            }
+        }
+    }
+}
+
 fn cmd_exec(
     vault_path: PathBuf,
     backend: Option<&str>,
     prefix: Option<String>,
     redact: bool,
+    warn_unsealed: bool,
     command: &[String],
 ) -> anyhow::Result<()> {
     let (program, args) = command
@@ -2008,13 +2144,34 @@ fn cmd_exec(
         cmd.env(name, value.as_str());
     }
 
+    let warn_unsealed = warn_unsealed_requested(warn_unsealed);
+
     if redact_requested(redact) {
         note!(
             "--redact: scrubbing {} injected value(s) from `{}`'s stdout/stderr.",
             injected.len(),
             program
         );
-        return exec_with_redaction(cmd, &injected);
+        return exec_with_redaction(cmd, &injected, warn_unsealed, program);
+    }
+
+    if warn_unsealed {
+        // Same tradeoff as --redact: observing the child after it starts
+        // means spawn+wait instead of exec()'s process-image replacement,
+        // which is why this path is opt-in rather than the default.
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn `{program}`: {e}"))?;
+        poll_seal_and_warn(child.id(), program);
+        let status = child.wait()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = status.signal() {
+                std::process::exit(128 + signal);
+            }
+        }
+        std::process::exit(status.code().unwrap_or(1));
     }
 
     // On Unix, replace this process image with the child so exit codes and
@@ -2049,6 +2206,8 @@ fn cmd_exec(
 fn exec_with_redaction(
     mut cmd: std::process::Command,
     injected: &[(String, SensitiveString)],
+    warn_unsealed: bool,
+    program: &str,
 ) -> anyhow::Result<()> {
     use std::process::Stdio;
 
@@ -2065,6 +2224,11 @@ fn exec_with_redaction(
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn child: {e}"))?;
+
+    if warn_unsealed {
+        poll_seal_and_warn(child.id(), program);
+    }
+
     let child_stdout = child
         .stdout
         .take()
@@ -3074,6 +3238,263 @@ fn read_project_prefix(marker_path: &Path) -> anyhow::Result<String> {
         .map(parse_project_prefix_line)
         .filter(|p| !p.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{} has no usable prefix line", marker_path.display()))
+}
+
+/// One process's `seal-check` finding. `exposed_names` is populated only
+/// when the process is `readable` AND the vault was open — and even then
+/// carries variable NAMES, never a value or anything read from `environ`
+/// past the first `=` of each entry.
+struct SealCheckRow {
+    pid: u32,
+    /// `unit:<name>` for `--unit`, the `/proc/<pid>/comm` short name for
+    /// `--pid`/`--all` when available, `None` if neither was obtainable.
+    label: Option<String>,
+    status: &'static str,
+    /// Populated only for `Unknown` — why this pid couldn't be classified.
+    detail: Option<String>,
+    exposed_names: Vec<String>,
+}
+
+/// Resolve `seal-check`'s target PID(s) from exactly one of `--pid`,
+/// `--unit`, or `--all` (clap's `conflicts_with_all` already enforces at
+/// most one; this enforces at least one). Each entry carries an optional
+/// human label for the report.
+fn resolve_seal_check_targets(
+    pid: Option<u32>,
+    unit: Option<String>,
+    all: bool,
+) -> anyhow::Result<Vec<(u32, Option<String>)>> {
+    if let Some(p) = pid {
+        return Ok(vec![(p, None)]);
+    }
+    if let Some(unit) = unit {
+        let output = std::process::Command::new("systemctl")
+            .args(["--user", "show", "-p", "MainPID", "--value", &unit])
+            .output()
+            .map_err(|e| {
+                anyhow::anyhow!("failed to run `systemctl --user show` for {unit}: {e}")
+            })?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "systemctl --user show -p MainPID --value {unit} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let main_pid: u32 = raw
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("unexpected MainPID output for {unit}: {raw:?}"))?;
+        if main_pid == 0 {
+            anyhow::bail!("unit {unit} is not running (MainPID=0)");
+        }
+        return Ok(vec![(main_pid, Some(format!("unit:{unit}")))]);
+    }
+    if all {
+        let pids = hearth_vault::hsm::platform::list_own_pids()
+            .map_err(|e| anyhow::anyhow!("failed to enumerate /proc: {e}"))?;
+        return Ok(pids.into_iter().map(|p| (p, None)).collect());
+    }
+    anyhow::bail!("specify exactly one of --pid <PID>, --unit <UNIT>, or --all")
+}
+
+/// Every env var NAME this vault would inject for a key under `prefix`
+/// (or every key, when `prefix` is `None`), covering both the stripped
+/// form `exec`/`export-env-file` actually produce (prefix removed) and the
+/// unstripped full-key form, since `seal-check` cannot know which prefix a
+/// given already-running consumer was launched with.
+fn vault_candidate_env_names(
+    entries: &[hearth_vault::VaultEntry],
+    prefix: Option<&str>,
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for entry in entries {
+        if let Some(prefix) = prefix
+            && !entry.key.starts_with(prefix)
+        {
+            continue;
+        }
+        // Unstripped: the whole key, uppercased, same separator mapping.
+        names.insert(env_name_for(&entry.key, ""));
+        // Stripped by the key's own leading directory segment, i.e. what a
+        // real `exec --prefix <that segment>/` invocation would produce.
+        if let Some(slash) = entry.key.rfind('/') {
+            names.insert(env_name_for(&entry.key, &entry.key[..=slash]));
+        }
+    }
+    names
+}
+
+fn cmd_seal_check(
+    vault_path: PathBuf,
+    backend: Option<&str>,
+    pid: Option<u32>,
+    unit: Option<String>,
+    all: bool,
+    prefix: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    if !cfg!(target_os = "linux") {
+        anyhow::bail!(
+            "seal-check needs /proc, which only exists on Linux (searched: macOS has no /proc \
+             at all; FreeBSD's optional procfs compat mount is not enabled by default and was \
+             not probed further here, so this refuses rather than guessing at its layout)."
+        );
+    }
+
+    let targets = resolve_seal_check_targets(pid, unit, all)?;
+    if targets.is_empty() {
+        eprintln!(
+            "note: --all found no processes running as you (besides this one, which \
+                    exited before it could be probed)."
+        );
+    }
+
+    // Probe every target FIRST — fast, no KDF — before opening the vault.
+    // Opening the vault pays a real Argon2id derivation (documented as
+    // "~120ms," but MEASURED to run into multiple seconds under CPU
+    // contention on this machine), and a short-lived target process can
+    // exit inside that window. Reading raw env NAMES here (still no
+    // values) rather than deferring the read until after the vault opens
+    // closes that race: the read either lands, or the target is already
+    // gone and reported `Unknown` either way — never silently misreported
+    // as "no vault-managed name exposed" because it disappeared while this
+    // command was busy deriving a key it didn't need yet for that part.
+    struct ProbeResult {
+        pid: u32,
+        label: Option<String>,
+        status: &'static str,
+        detail: Option<String>,
+        raw_env_names: Vec<String>,
+    }
+    let mut probes = Vec::with_capacity(targets.len());
+    for (target_pid, label) in targets {
+        let label = label.or_else(|| hearth_vault::hsm::platform::read_proc_comm(target_pid));
+        match hearth_vault::hsm::platform::probe_seal_status(target_pid) {
+            hearth_vault::hsm::platform::ProcSealStatus::Sealed => probes.push(ProbeResult {
+                pid: target_pid,
+                label,
+                status: "sealed",
+                detail: None,
+                raw_env_names: Vec::new(),
+            }),
+            hearth_vault::hsm::platform::ProcSealStatus::Unknown(reason) => {
+                probes.push(ProbeResult {
+                    pid: target_pid,
+                    label,
+                    status: "unknown",
+                    detail: Some(reason),
+                    raw_env_names: Vec::new(),
+                })
+            }
+            hearth_vault::hsm::platform::ProcSealStatus::Readable => {
+                let raw_env_names = hearth_vault::hsm::platform::read_proc_env_names(target_pid)
+                    .unwrap_or_default();
+                probes.push(ProbeResult {
+                    pid: target_pid,
+                    label,
+                    status: "readable",
+                    detail: None,
+                    raw_env_names,
+                });
+            }
+        }
+    }
+
+    // Best-effort: a vault that cannot be opened (locked, wrong passphrase,
+    // none at this path) does not stop seal status from being reported — it
+    // only means the name-overlap check is skipped, and that is stated
+    // explicitly rather than silently reported as "nothing exposed."
+    let candidate_names = match open_vault(vault_path, backend) {
+        Ok(store) => {
+            let entries = store.list();
+            Some(vault_candidate_env_names(&entries, prefix.as_deref()))
+        }
+        Err(e) => {
+            eprintln!(
+                "note: vault not opened ({e}) — reporting seal status only; name-overlap \
+                 check skipped."
+            );
+            None
+        }
+    };
+
+    let rows: Vec<SealCheckRow> = probes
+        .into_iter()
+        .map(|p| {
+            let exposed_names = match &candidate_names {
+                Some(candidates) if p.status == "readable" => p
+                    .raw_env_names
+                    .into_iter()
+                    .filter(|n| candidates.contains(n))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            SealCheckRow {
+                pid: p.pid,
+                label: p.label,
+                status: p.status,
+                detail: p.detail,
+                exposed_names,
+            }
+        })
+        .collect();
+
+    let any_exposed = rows
+        .iter()
+        .any(|r| r.status == "readable" && !r.exposed_names.is_empty());
+
+    if json {
+        let out: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "pid": r.pid,
+                    "label": r.label,
+                    "status": r.status,
+                    "detail": r.detail,
+                    "exposed_vault_names": r.exposed_names,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        for r in &rows {
+            let label = r
+                .label
+                .as_deref()
+                .map(|l| format!(" ({l})"))
+                .unwrap_or_default();
+            match r.status {
+                "sealed" => println!("PID {}{label}: SEALED", r.pid),
+                "unknown" => println!(
+                    "PID {}{label}: UNKNOWN — {}",
+                    r.pid,
+                    r.detail.as_deref().unwrap_or("no reason given")
+                ),
+                "readable" if r.exposed_names.is_empty() => {
+                    println!(
+                        "PID {}{label}: READABLE (no vault-managed names exposed)",
+                        r.pid
+                    )
+                }
+                "readable" => println!(
+                    "PID {}{label}: READABLE — exposes vault-managed name(s): {}",
+                    r.pid,
+                    r.exposed_names.join(", ")
+                ),
+                _ => unreachable!(),
+            }
+        }
+        if candidate_names.is_none() {
+            eprintln!("(name-overlap check skipped for all rows above — vault was not opened)");
+        }
+    }
+
+    if any_exposed {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn cmd_project_prefix() -> anyhow::Result<()> {
