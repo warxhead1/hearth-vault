@@ -263,6 +263,23 @@ pub fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
 /// Best-effort: prevent this process from producing a core dump. Never
 /// panics, never returns an error the caller must handle — a failure here
 /// just means the OS default (dumps enabled) applies.
+///
+/// On Linux this also closes `/proc/self/{environ,mem,maps,...}` to every
+/// other same-UID process (the kernel reassigns those entries to root once
+/// `PR_SET_DUMPABLE` is cleared) — the actual fix for the 2026-09-04
+/// incident where a same-UID agent read a live credential out of
+/// `/proc/<engine-pid>/environ`. Measured (`stat -c %U /proc/<pid>/environ`
+/// before/after `prctl` in a throwaway test process): owner flips from the
+/// real user to `root`, and `ps eww -p <pid>` stops showing the value.
+///
+/// Two things this does NOT do, measured directly and not to be assumed
+/// otherwise: it does not survive a subsequent `execve` (the kernel resets
+/// `dumpable` to 1 on a normal exec — a child spawned by `hearth-vault exec`
+/// is NOT sealed by the vault process having called this; only the child
+/// calling it again, itself, after its own exec, seals it — see
+/// `USAGE.md`/`SECURITY.md` "Sealing a secret-holding process" for the
+/// per-language snippet), and it does not hide argv (`/proc/<pid>/cmdline`
+/// stays readable regardless).
 pub fn disable_core_dumps() {
     #[cfg(target_os = "linux")]
     {
@@ -298,6 +315,95 @@ pub fn disable_core_dumps() {
     // Windows: no user-mode equivalent of RLIMIT_CORE/PR_SET_DUMPABLE. Crash
     // dump behavior there is a machine-wide registry/WER policy, out of
     // scope for a per-process best-effort call. No-op.
+}
+
+/// Whether a process's `/proc/<pid>/environ` (and `/mem`, `/maps`, ...) is
+/// closed to same-UID readers.
+///
+/// Backs `hearth-vault seal-check` and `exec --warn-unsealed`. See the
+/// module-level incident note in `disable_core_dumps` for why this exists:
+/// `PR_SET_DUMPABLE` does NOT survive `execve`, so a parent can never seal a
+/// child for it — the child must seal itself, and this is how a THIRD party
+/// (the vault, or an operator) can tell whether it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcSealStatus {
+    /// `/proc/<pid>/environ` is owned by a different uid than the caller's
+    /// own (in practice: the kernel reassigns it to root once the process
+    /// calls `prctl(PR_SET_DUMPABLE, 0)`), so a same-UID reader is denied.
+    Sealed,
+    /// Still owned by the caller's own uid — a same-UID reader (an agent,
+    /// `ps eww`, a debugger) can read the full environment, including any
+    /// vault-injected secret values.
+    Readable,
+    /// The process is gone, not ours to inspect, or `/proc` doesn't exist
+    /// on this platform (non-Linux). Carries a short reason, never any
+    /// data read from the target.
+    Unknown(String),
+}
+
+/// Best-effort probe of `pid`'s seal state. Linux-only: `/proc` is a Linux
+/// construct, and there is no portable equivalent on macOS/BSD/Windows to
+/// probe from outside the process (searched: no macOS `/proc`; FreeBSD's
+/// optional `procfs` mount is not enabled by default and was not probed
+/// further here — this function conservatively returns `Unknown` on every
+/// non-Linux target rather than guessing).
+pub fn probe_seal_status(pid: u32) -> ProcSealStatus {
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/proc/{pid}/environ");
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => return ProcSealStatus::Unknown(format!("{path}: {e}")),
+        };
+        use std::os::unix::fs::MetadataExt;
+        let owner = meta.uid();
+        // SAFETY: getuid() takes no arguments and cannot fail.
+        let self_uid = unsafe { libc::getuid() };
+        if self_uid == 0 {
+            // Root can read a sealed process's /proc entries too (dumpable
+            // only gates *other* same-UID readers) — the ownership check is
+            // meaningless for a root caller, so say so rather than report a
+            // false Readable/Sealed.
+            return ProcSealStatus::Unknown(
+                "caller is root — root can read a sealed process's /proc entries too, so \
+                 ownership cannot distinguish sealed from unsealed here"
+                    .to_string(),
+            );
+        }
+        if owner == self_uid {
+            ProcSealStatus::Readable
+        } else {
+            ProcSealStatus::Sealed
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        ProcSealStatus::Unknown("seal probing needs /proc, which only exists on Linux".to_string())
+    }
+}
+
+/// Read only the *names* of `pid`'s environment variables — never a value.
+///
+/// Splits `/proc/<pid>/environ` on NUL and keeps only the substring before
+/// the first `=` of each entry; everything after `=` is dropped immediately
+/// and never stored, returned, printed, or compared. This is the primitive
+/// `seal-check` uses to report "these vault-managed NAMES are exposed"
+/// without a value ever leaving this function.
+#[cfg(target_os = "linux")]
+pub fn read_proc_env_names(pid: u32) -> std::io::Result<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ"))?;
+    Ok(raw
+        .split(|b| *b == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let name_bytes = match entry.iter().position(|b| *b == b'=') {
+                Some(idx) => &entry[..idx],
+                None => entry,
+            };
+            String::from_utf8_lossy(name_bytes).into_owned()
+        })
+        .collect())
 }
 
 /// True if stdout is a terminal. Backs the CLI's non-TTY refusal rule for
@@ -586,5 +692,115 @@ mod tests {
         // captured/redirected, so this is expected to return false; the
         // point of this test is just that the platform call doesn't panic.
         let _ = stdout_is_tty();
+    }
+
+    /// Helper invoked as a child process by
+    /// `probe_seal_status_distinguishes_sealed_from_unsealed_process` below
+    /// (same `current_exe()` re-invocation trick as `tests/cli.rs`'s
+    /// `helper_print_env`: `std::env::current_exe()` inside a `#[test]`
+    /// returns this compiled test-harness binary, which is a normal
+    /// executable). Under a plain `cargo test` run, both env vars are unset
+    /// and this is a no-op.
+    #[test]
+    fn helper_seal_self_and_wait() {
+        if std::env::var("HV_SEAL_HELPER_SEAL").is_ok() {
+            disable_core_dumps();
+        }
+        if std::env::var("HV_SEAL_HELPER_SEAL").is_ok()
+            || std::env::var("HV_SEAL_HELPER_WAIT").is_ok()
+        {
+            use std::io::Write;
+            // Distinctive marker so the parent can find this exact line
+            // among libtest's own "running 1 test" chatter, same convention
+            // as `tests/cli.rs`'s `HV_ECHO_BEGIN`/`HV_ECHO_END`.
+            println!("HV_SEAL_HELPER_PID:{}", std::process::id());
+            std::io::stdout().flush().ok();
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        }
+    }
+
+    /// The actual claim this module exists to back: after
+    /// `disable_core_dumps()`, `/proc/<pid>/environ` is closed to a
+    /// same-UID reader; without it, the same reader can read it. Spawns two
+    /// real child processes (this same test binary, re-invoked) to prove
+    /// both sides rather than asserting behavior of a mocked probe.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_seal_status_distinguishes_sealed_from_unsealed_process() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+
+        let exe = std::env::current_exe().expect("path to this test binary");
+
+        // clippy's zombie_processes lint can't see that the caller below
+        // (after this closure returns) always kills+waits both children on
+        // every path, including panics via the outer test's own assertions
+        // failing before cleanup — that residual risk is the same as any
+        // other test that panics mid-assertion, not specific to this one.
+        #[allow(clippy::zombie_processes)]
+        let spawn_and_read_pid = |env_var: &str| -> (std::process::Child, u32) {
+            let mut child = Command::new(&exe)
+                .args([
+                    "hsm::platform::tests::helper_seal_self_and_wait",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(env_var, "1")
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn helper child");
+            let stdout = child.stdout.take().expect("piped stdout");
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).expect("read helper stdout");
+                assert!(n > 0, "helper exited before printing its PID marker");
+                if let Some(rest) = line.trim_end().strip_prefix("HV_SEAL_HELPER_PID:") {
+                    let pid: u32 = rest.parse().expect("parse helper PID");
+                    // Leak the reader thread's ownership of stdout by
+                    // forgetting it: we've read what we need, and the
+                    // helper's later output (none, in this case) doesn't
+                    // matter. Keep `child` alive so the process doesn't
+                    // exit/reap before we probe it.
+                    std::mem::forget(reader);
+                    return (child, pid);
+                }
+            }
+        };
+
+        let (mut sealed_child, sealed_pid) = spawn_and_read_pid("HV_SEAL_HELPER_SEAL");
+        let (mut unsealed_child, unsealed_pid) = spawn_and_read_pid("HV_SEAL_HELPER_WAIT");
+
+        assert_eq!(
+            probe_seal_status(sealed_pid),
+            ProcSealStatus::Sealed,
+            "a child that called disable_core_dumps() before printing its PID must be Sealed"
+        );
+        assert_eq!(
+            probe_seal_status(unsealed_pid),
+            ProcSealStatus::Readable,
+            "a plain child (no disable_core_dumps()) must be Readable"
+        );
+
+        // Only the env var NAME is asserted anywhere in this test — the
+        // value never leaves the helper process (never printed, never read
+        // back here) as the whole point of read_proc_env_names.
+        let sealed_names = read_proc_env_names(sealed_pid);
+        assert!(
+            sealed_names.is_err(),
+            "reading environ of a sealed same-UID process must be denied"
+        );
+        let unsealed_names =
+            read_proc_env_names(unsealed_pid).expect("read environ of an unsealed process");
+        assert!(
+            unsealed_names.iter().any(|n| n == "HV_SEAL_HELPER_WAIT"),
+            "expected HV_SEAL_HELPER_WAIT among the unsealed child's env var NAMES, got: {unsealed_names:?}"
+        );
+
+        let _ = sealed_child.kill();
+        let _ = sealed_child.wait();
+        let _ = unsealed_child.kill();
+        let _ = unsealed_child.wait();
     }
 }
