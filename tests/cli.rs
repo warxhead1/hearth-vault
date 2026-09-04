@@ -63,9 +63,14 @@ fn helper_print_env() {
     // must outlast the full window so a still-`Readable` child survives
     // long enough for the warning's LAST probe to actually fire, and so a
     // slow-to-seal child (under parallel-test scheduler contention) is
-    // still alive when a later probe catches it sealed.
+    // still alive when a later probe catches it sealed. The margin here
+    // (well beyond the nominal 2s) is deliberate: MEASURED flake under a
+    // fully loaded `pre-push` run (full test suite + a concurrent build)
+    // where `thread::sleep`'s 50ms intervals stretched enough that the
+    // poll loop's own wall-clock time exceeded a tighter hold-open budget,
+    // making the child exit mid-poll and the warning never fire.
     if std::env::var("HV_TEST_HOLD_OPEN").is_ok() {
-        std::thread::sleep(std::time::Duration::from_millis(2500));
+        std::thread::sleep(std::time::Duration::from_millis(8000));
     }
 }
 
