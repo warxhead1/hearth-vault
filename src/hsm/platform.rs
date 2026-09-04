@@ -341,6 +341,61 @@ pub enum ProcSealStatus {
     Unknown(String),
 }
 
+/// The calling process's real UID. A trivial wrapper so the rest of the
+/// codebase never needs its own `unsafe` block for something this simple —
+/// this file's module doc says `unsafe` stays contained here.
+#[cfg(unix)]
+pub fn own_uid() -> u32 {
+    // SAFETY: getuid() takes no arguments and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// PIDs of every process currently running as the caller, found by reading
+/// `/proc/*/status`'s `Uid:` line (the REAL uid — first of the four numbers
+/// on that line — compared against `own_uid()`). Backs `seal-check --all`.
+/// Never reads `environ`/`mem`/`maps` of anything it enumerates; a process
+/// that vanishes mid-scan (exited, or a status line in an unexpected shape)
+/// is silently skipped rather than failing the whole sweep.
+#[cfg(target_os = "linux")]
+pub fn list_own_pids() -> std::io::Result<Vec<u32>> {
+    let self_uid = own_uid();
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let Ok(entry) = entry else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        let Some(uid_line) = status.lines().find(|l| l.starts_with("Uid:")) else {
+            continue;
+        };
+        let real_uid = uid_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u32>().ok());
+        if real_uid == Some(self_uid) {
+            pids.push(pid);
+        }
+    }
+    Ok(pids)
+}
+
+/// The short executable name from `/proc/<pid>/comm` — non-secret process
+/// metadata (like argv), used only to make a `seal-check --all` report
+/// readable. `None` if the process is gone or `/proc` is unavailable.
+#[cfg(target_os = "linux")]
+pub fn read_proc_comm(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 /// Best-effort probe of `pid`'s seal state. Linux-only: `/proc` is a Linux
 /// construct, and there is no portable equivalent on macOS/BSD/Windows to
 /// probe from outside the process (searched: no macOS `/proc`; FreeBSD's
@@ -357,8 +412,7 @@ pub fn probe_seal_status(pid: u32) -> ProcSealStatus {
         };
         use std::os::unix::fs::MetadataExt;
         let owner = meta.uid();
-        // SAFETY: getuid() takes no arguments and cannot fail.
-        let self_uid = unsafe { libc::getuid() };
+        let self_uid = own_uid();
         if self_uid == 0 {
             // Root can read a sealed process's /proc entries too (dumpable
             // only gates *other* same-UID readers) — the ownership check is
