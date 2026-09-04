@@ -219,6 +219,26 @@ exec [--prefix P] [--redact] -- <command...>
                          "Redacting a child's output" below before turning
                          it on for a script that captures exec's output as
                          the value.
+                         `--warn-unsealed` (or HEARTH_VAULT_WARN_UNSEALED=1):
+                         after starting the child, check whether IT has
+                         sealed its own `/proc/<pid>/environ` and print a
+                         stderr warning if not. OFF by default, never fatal
+                         -- see "Sealing a secret-holding process" below for
+                         why `hearth-vault` cannot do this sealing FOR the
+                         child, only tell you it hasn't happened.
+seal-check [--pid P|--unit U|--all] [--prefix P] [--json]
+                         Audit whether an ALREADY-RUNNING process (not one
+                         you just launched with `exec`) has sealed itself.
+                         `--pid`: one process. `--unit NAME`: resolve a
+                         systemd --user unit's MainPID. `--all`: every
+                         process running as you. Reports SEALED or READABLE
+                         per process; a READABLE one is further checked for
+                         whether any of its exposed environment variable
+                         NAMES match one this vault would generate --
+                         never a value, only a name. Exits 1 if it finds a
+                         READABLE process holding a vault-managed name (wire
+                         this into a periodic check or CI), 0 otherwise.
+                         Linux-only. See "Sealing a secret-holding process."
 sign --key K --algorithm ALG --message M
                          Sign M with the private key stored at K. Algorithms:
                          RSA-PSS-SHA256, RS256, RS512. Prints a base64
@@ -415,6 +435,111 @@ captured through a pipe instead of inherited straight from your terminal.
 For a fully interactive program (one reading raw terminal input, resize
 events, etc.) that can change behavior; plain `exec` (no flag) still gives
 an unmodified TTY passthrough.
+
+### Sealing a secret-holding process
+
+**Real incident, 2026-09-04:** an AI coding agent read a live credential
+straight out of `/proc/<pid>/environ` of a process `hearth-vault exec`
+had launched — the SAME uid, no privilege escalation, just `cat
+/proc/<pid>/environ` (or `ps eww -p <pid>`, which shows the same thing).
+`hearth-vault` was not compromised; the injected value was sitting in
+plain sight in a place any other process running as you can already read.
+
+**`hearth-vault` cannot fix this for you.** The natural instinct is "have
+`exec`'s parent process call `prctl(PR_SET_DUMPABLE, 0)` before starting
+the child." Measured directly: it does not survive `execve`. The kernel
+resets `dumpable` to `1` on a normal exec, so anything the parent sealed
+about itself has no effect on the child's own process image. **Only the
+child calling this on itself, after its own exec, actually closes
+`/proc/<pid>/environ` (and `/mem`, `/maps`) to another same-UID reader** —
+measured: `stat -c %U /proc/<pid>/environ` flips from your username to
+`root`, and `ps eww -p <pid>` stops showing the value.
+
+Add this as close to the top of your process's `main()`/entrypoint as
+possible — before anything touches the injected secret:
+
+**Go** (no new dependency — `syscall.SYS_PRCTL`):
+
+```go
+// Linux only. PR_SET_DUMPABLE = 4.
+if runtime.GOOS == "linux" {
+    syscall.RawSyscall(syscall.SYS_PRCTL, 4 /* PR_SET_DUMPABLE */, 0, 0)
+}
+```
+
+**Rust** (`libc` crate, already a near-universal transitive dependency):
+
+```rust
+#[cfg(target_os = "linux")]
+{
+    // SAFETY: prctl(PR_SET_DUMPABLE, 0) takes no pointer arguments and
+    // cannot fault; best-effort, so a nonzero (failure) return is ignored.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0); }
+}
+```
+
+**C:**
+
+```c
+#include <sys/prctl.h>
+#ifdef __linux__
+    prctl(PR_SET_DUMPABLE, 0);
+#endif
+```
+
+**Python** (via `ctypes`, no dependency):
+
+```python
+import sys
+if sys.platform == "linux":
+    import ctypes
+    PR_SET_DUMPABLE = 4
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)
+```
+
+**Node.js** has no built-in `prctl` binding; shell out to a tiny helper or
+accept the exposure — there is no in-process option without a native
+add-on.
+
+**What this buys you, and what it does not:**
+
+- Closes `/proc/<pid>/environ`, `/mem`, and `/maps` to every OTHER process
+  running as you — the exact mechanism behind the incident above.
+- Disables core dumps for that process. For a secret-holding process this
+  is a feature, not a side effect: a crash can no longer write your
+  injected secrets to a core file on disk.
+- Blocks `gdb`/`delve`/`strace -p` attach from the process owner too — a
+  real debugging cost, worth knowing about before you hit it at 2am.
+- Does **NOT** protect `/proc/<pid>/cmdline` (argv) — a secret passed as a
+  command-line argument is exposed regardless of sealing. Never put a
+  secret in argv; that rule doesn't go away.
+- Does **NOT** stop a same-UID attacker who can simply run `hearth-vault
+  exec` (or `hearth-vault agent` + `unlock`) themselves — sealing closes
+  one concrete, measured hole in an already-running process; it is not a
+  substitute for controlling what an agent with shell access is allowed to
+  run at all (see "Limitations" below).
+
+**Verifying it worked:**
+
+```sh
+hearth-vault exec --prefix myapp/ --warn-unsealed -- ./start-server
+```
+
+prints a stderr warning naming the exposure if the child you just started
+did not seal itself. To audit something already running (a systemd unit,
+a long-lived daemon you didn't just launch):
+
+```sh
+hearth-vault seal-check --unit myapp.service
+hearth-vault seal-check --all --prefix myapp/
+```
+
+`seal-check` reports SEALED or READABLE per process, and for a READABLE
+one, whether any of its exposed environment variable *names* match a name
+this vault would generate — never a value, only a name. Both commands are
+best-effort and Linux-only (the underlying probe needs `/proc`); on other
+platforms `--warn-unsealed` is a silent no-op and `seal-check` refuses
+outright rather than reporting something it cannot actually check.
 
 ## Limitations
 

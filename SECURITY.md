@@ -56,13 +56,51 @@
   by your passphrase.
 - **Another process running as your own user.** This bounds the unlock
   agent specifically. Its socket keeps *other users* out (`0600` in a `0700`
-  directory, plus an `SO_PEERCRED` uid check), but anything running as you
-  can already read `/proc/<pid>/environ` of the children `exec` creates,
-  ptrace them, or simply run `hearth-vault exec` itself. The agent is a
-  strict improvement on the `HEARTH_VAULT_PASSPHRASE` environment variable
-  it replaces — bounded lifetime, not inherited by children, invisible to
-  `ps` and `environ`, and holding a per-vault wrap key rather than the
+  directory, plus an `SO_PEERCRED` uid check). The agent is a strict
+  improvement on the `HEARTH_VAULT_PASSPHRASE` environment variable it
+  replaces — bounded lifetime, not inherited by children, invisible to `ps`
+  and `environ`, and holding a per-vault wrap key rather than the
   passphrase — and it is not a same-machine isolation boundary.
+
+  **UPDATED 2026-09-04** (an earlier version of this bullet said flatly that
+  "anything running as you can already read `/proc/<pid>/environ` of the
+  children `exec` creates" — that is still true of an UNSEALED consumer and
+  is narrowed, not retracted, below; the same day, a same-UID AI coding agent
+  read a live credential straight out of `/proc/<engine-pid>/environ` for a
+  process launched via `hearth-vault exec --prefix tachyonac/`):
+
+  - **An unsealed consumer is still fully exposed, unchanged from before.**
+    `hearth-vault exec`'s parent process CANNOT close this for the child it
+    launches: `prctl(PR_SET_DUMPABLE, 0)` does not survive `execve` (measured
+    directly — the kernel resets `dumpable` to 1 on a normal exec), so only
+    the child calling it again, itself, after its own exec, has any effect.
+    Any process that hasn't adopted this — which is most of them today — has
+    its full environment (including whatever `exec` injected) readable by
+    any other process running as you: `cat /proc/<pid>/environ`, `ps eww -p
+    <pid>`, an AI agent's shell tool. See README.md "Sealing a
+    secret-holding process" for the fix, and use `hearth-vault exec
+    --warn-unsealed` or `hearth-vault seal-check` to find out which of your
+    consumers this applies to.
+  - **A sealed consumer closes `/proc/<pid>/{environ,mem,maps}` to same-UID
+    readers** (measured: `stat -c %U /proc/<pid>/environ` flips from the
+    real user to `root`; `ps eww -p <pid>` stops showing the value), which is
+    the actual fix for the incident above. It does NOT close everything:
+    `/proc/<pid>/cmdline` (argv) stays readable regardless of sealing — never
+    put a secret in argv — and a same-UID attacker who cannot read the
+    sealed process's memory can still simply run `hearth-vault exec` (or
+    `hearth-vault agent` + `unlock`) themselves to obtain the same
+    capability the sealed process holds. Sealing closes one concrete,
+    measured hole; it is not a substitute for "an agent that can run
+    arbitrary commands as you" two bullets below, which remains fully out of
+    scope.
+  - **An ancestor of a sealed process is unaffected by the child's own
+    seal.** Sealing is per-process, not inherited backwards: the vault
+    process and the systemd-unit's shell wrapper (if any) each need their
+    own call to be closed off, and `hearth-vault` itself already does this
+    (`disable_core_dumps()`, first line of `main()`) — measured: its own
+    `/proc/<pid>/environ`, and the persisted `hearth-vault agent --daemon`
+    child (survives via `fork()`, which inherits the dumpable flag, unlike
+    `execve`), are both `root`-owned while running.
 - **Who sent you a share bundle.** Bundle confidentiality is real: only the
   holder of the target identity can open one, and tampering fails closed.
   Sender authenticity is *not* provided — an ephemeral sender key means a
