@@ -2074,33 +2074,56 @@ fn warn_unsealed_requested(flag: bool) -> bool {
 /// comment for why a hard failure here would be actively harmful (breaking
 /// every consumer that hasn't adopted sealing yet, which today is nearly all
 /// of them).
+/// The one place the unsealed-child warning text lives, so the poll loop
+/// cannot warn with one wording and a future caller with another.
+fn warn_unsealed_child(pid: u32, program: &str) {
+    eprintln!(
+        "warning: `{program}` (pid {pid}) has not sealed /proc/{pid}/environ — the \
+         secret(s) just injected into its environment are readable by ANY OTHER \
+         process running as you (e.g. `ps eww -p {pid}`, `cat \
+         /proc/{pid}/environ`, an AI coding agent's shell tool reading /proc \
+         directly). This is not a hearth-vault bug: `PR_SET_DUMPABLE` does not \
+         survive execve, so only `{program}` itself can close this. See \
+         README.md \"Sealing a secret-holding process\" for a copy-pasteable \
+         snippet (Go/Rust/C/Python), or `hearth-vault seal-check --pid {pid}` to \
+         re-check later."
+    );
+}
+
 fn poll_seal_and_warn(pid: u32, program: &str) {
     use hearth_vault::hsm::platform::{ProcSealStatus, probe_seal_status};
 
     const ATTEMPTS: u32 = 40;
     const INTERVAL_MS: u64 = 50;
 
-    for attempt in 0..ATTEMPTS {
+    // Whether we ever got a DEFINITE "this process is readable" answer.
+    // Unknown must not be read as "fine": on a loaded host the child has not
+    // yet materialized in /proc when the first probe runs, and the original
+    // `Unknown => return` aborted the entire poll on that first inconclusive
+    // check, silently skipping the warning. MEASURED 2026-09-04: the unsealed
+    // -child test passed alone (13s) and failed inside the full parallel
+    // suite for exactly this reason. Unknown now keeps polling; we stay
+    // silent only if we never once saw the child readable, which is the
+    // genuine non-Linux / already-exited case.
+    let mut saw_readable = false;
+
+    for _ in 0..ATTEMPTS {
         match probe_seal_status(pid) {
+            // A definite seal is the only outcome that buys silence.
             ProcSealStatus::Sealed => return,
-            ProcSealStatus::Unknown(_) => return,
-            ProcSealStatus::Readable if attempt + 1 == ATTEMPTS => {
-                eprintln!(
-                    "warning: `{program}` (pid {pid}) has not sealed /proc/{pid}/environ — the \
-                     secret(s) just injected into its environment are readable by ANY OTHER \
-                     process running as you (e.g. `ps eww -p {pid}`, `cat \
-                     /proc/{pid}/environ`, an AI coding agent's shell tool reading /proc \
-                     directly). This is not a hearth-vault bug: `PR_SET_DUMPABLE` does not \
-                     survive execve, so only `{program}` itself can close this. See \
-                     README.md \"Sealing a secret-holding process\" for a copy-pasteable \
-                     snippet (Go/Rust/C/Python), or `hearth-vault seal-check --pid {pid}` to \
-                     re-check later."
-                );
-            }
-            ProcSealStatus::Readable => {
-                std::thread::sleep(std::time::Duration::from_millis(INTERVAL_MS));
-            }
+            ProcSealStatus::Readable => saw_readable = true,
+            // Inconclusive: keep waiting rather than concluding anything.
+            ProcSealStatus::Unknown(_) => {}
         }
+        std::thread::sleep(std::time::Duration::from_millis(INTERVAL_MS));
+    }
+
+    // The window expired without the child ever sealing itself. If we saw it
+    // readable at any point but the final attempt happened to land on an
+    // Unknown (the child exited between probes), the exposure was real while
+    // it lived and still deserves the warning.
+    if saw_readable {
+        warn_unsealed_child(pid, program);
     }
 }
 
