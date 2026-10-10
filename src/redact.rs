@@ -19,6 +19,14 @@
 //!   be caught. We hold back the last `(longest pattern length - 1)` bytes
 //!   of every processed chunk as `carry`, so a match whose completion needs
 //!   the next chunk is never flushed early — and never lost.
+//! - **Line-prompt.** The tail hold-back is the longest secret's length, which
+//!   for long tokens is kilobytes — a long-running service's short log lines
+//!   sat in `carry` for an hour (gfn-relay under systemd, 2026-10-10: zero
+//!   journal lines across a whole session). When no pattern contains a
+//!   newline, no match can span one, so everything through the last `\n` in
+//!   the buffer is flushed at once; only an unfinished line is held. A secret
+//!   that does contain a newline (a PEM body) disables this and the plain
+//!   hold-back applies.
 //! - **Longest-match-wins.** If one secret value is a substring of another
 //!   (e.g. a short token that is itself a prefix of a longer one), the
 //!   longer match must win outright, never get shredded into two replacements
@@ -72,6 +80,9 @@ pub struct Redactor {
     /// Bytes to hold back at the tail of every non-final chunk: the longest
     /// pattern's length minus one. Zero when there is nothing to redact.
     hold_back: usize,
+    /// No pattern contains `\n`, so a match can never span a line break and
+    /// complete lines are safe to flush immediately.
+    line_safe: bool,
 }
 
 impl Redactor {
@@ -106,6 +117,8 @@ impl Redactor {
             .unwrap_or(0)
             .saturating_sub(1);
 
+        let line_safe = patterns.iter().all(|p| !p.contains(&b'\n'));
+
         // LeftmostLongest: at any position where more than one pattern
         // could match, the longest one wins outright rather than the first
         // one tried — this is what keeps a substring secret from shredding
@@ -119,6 +132,7 @@ impl Redactor {
             ac: Arc::new(ac),
             replacements: Arc::new(replacements),
             hold_back,
+            line_safe,
         }
     }
 
@@ -137,6 +151,7 @@ impl Redactor {
             ac: Arc::clone(&self.ac),
             replacements: Arc::clone(&self.replacements),
             hold_back: self.hold_back,
+            line_safe: self.line_safe,
             carry: Vec::new(),
         }
     }
@@ -149,6 +164,7 @@ pub struct RedactStream {
     ac: Arc<AhoCorasick>,
     replacements: Arc<Vec<Vec<u8>>>,
     hold_back: usize,
+    line_safe: bool,
     carry: Vec<u8>,
 }
 
@@ -165,7 +181,15 @@ impl RedactStream {
         // At EOF nothing more is coming, so there is no reason to withhold
         // a tail — flush everything.
         let hold_back = if eof { 0 } else { self.hold_back };
-        let safe_len = buf.len().saturating_sub(hold_back);
+        let mut safe_len = buf.len().saturating_sub(hold_back);
+        // A match never spans a newline (line_safe), so any match touching the
+        // withheld tail starts after the last newline: everything through it
+        // can go now, redacted.
+        if self.line_safe {
+            if let Some(nl) = buf.iter().rposition(|&b| b == b'\n') {
+                safe_len = safe_len.max(nl + 1);
+            }
+        }
 
         let mut out = Vec::with_capacity(buf.len());
         let mut cursor = 0usize;
@@ -224,6 +248,50 @@ mod tests {
             "raw secret leaked across chunk boundary: {out}"
         );
         assert_eq!(out, "before=<vault:DB_PASSWORD>=after");
+    }
+
+    /// A complete line is flushed at once even when the longest secret is far
+    /// longer than the line (the hold-back would otherwise sit on it).
+    #[test]
+    fn complete_lines_flush_immediately() {
+        let long = "A".repeat(3000); // fixture: a long token
+        let r = redactor(&[("TOKENS", long.as_str())]);
+        let mut s = r.stream();
+        let out = s.process(b"relay listening on :8090\npartial", false);
+        assert_eq!(out, b"relay listening on :8090\n");
+        let out = s.process(b" line\n", false);
+        assert_eq!(out, b"partial line\n");
+    }
+
+    /// Line-prompt flushing still redacts: a secret inside a complete line,
+    /// and one split across chunks within an unfinished line.
+    #[test]
+    fn line_flush_still_redacts() {
+        let secret = "tok_0123456789_secret_value"; // hearth-vault:allow (test fixture, not a credential)
+        let r = redactor(&[("API_TOKEN", secret)]);
+        let mut s = r.stream();
+        let mut out = s.process(format!("a={secret}\nb=tok_0123").as_bytes(), false);
+        assert_eq!(out, b"a=<vault:API_TOKEN>\n");
+        out = s.process(b"456789_secret_value\n", false);
+        assert_eq!(out, b"b=<vault:API_TOKEN>\n");
+    }
+
+    /// A secret containing a newline disables line flushing: a PEM body split at
+    /// its own newline must not leak its first half.
+    #[test]
+    fn multiline_secret_falls_back_to_hold_back() {
+        let pem =
+            "-----BEGIN KEY-----\nMIIBVwIBADANBgkqhkiG9w0BAQEFAASCAUEwggE9\n-----END KEY-----"; // fixture
+        let r = redactor(&[("SSH_KEY", pem)]);
+        let mut s = r.stream();
+        let mut out = s.process(b"key=-----BEGIN KEY-----\n", false);
+        out.extend(s.process(
+            b"MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAUEwggE9\n-----END KEY-----\n",
+            true,
+        ));
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("BEGIN KEY"), "multiline secret leaked: {out}");
+        assert_eq!(out, "key=<vault:SSH_KEY>\n");
     }
 
     /// Case 2: two secrets where one is a byte-for-byte substring of the
