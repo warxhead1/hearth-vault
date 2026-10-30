@@ -31,7 +31,7 @@ required-features = ["os-keyring"]
 default = ["os-keyring", "github-app-token"]
 # TPM2 links libtss2-esys (C). Opt-in: a bare `cargo install` must not need it.
 tpm2 = ["dep:tss-esapi"]
-os-keyring = ["dep:keyring"]
+os-keyring = ["dep:keyring", "dep:dbus-secret-service"]
 # The ONLY code in this crate that opens a network socket is minting a GitHub
 # App installation token (POST api.github.com, and only when you run that one
 # subcommand). It is a feature so that "this binary cannot phone home" is
@@ -85,16 +85,20 @@ tss-esapi = { version = "7.6", optional = true }
 # that "sealed" tier-2 secrets into that mock would report success and store
 # nothing -- so the platform feature is mandatory here, per target.
 #
-# Linux uses async-secret-service (zbus, pure Rust) rather than
-# sync-secret-service (libdbus, a C library): it keeps `cargo install`
-# working with no system -dev packages and keeps the door open for static
-# builds. keyring blocks on it internally, so our call sites stay sync.
+# Linux uses sync-secret-service (dbus-secret-service over libdbus) with
+# `vendored`, which builds libdbus from source: no system -dev package is
+# needed, only a C compiler. The pure-Rust async-secret-service path was
+# dropped because it pulls zbus 4 / zvariant 4, which RustSec flags as
+# unmaintained (RUSTSEC-2026-0370..0372) with no upstream fix.
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6", optional = true, features = [
-    "async-secret-service",
-    "crypto-rust",
-    "async-io",
+    "sync-secret-service",
 ] }
+# Features set on dbus-secret-service directly (unified with keyring's copy),
+# not via keyring's `crypto-rust`/`vendored`: those carry weak
+# `secret-service?/..` references that keep zbus in Cargo.lock, and so in
+# `cargo audit`, even though it is never compiled.
+dbus-secret-service = { version = "4", optional = true, features = ["crypto-rust", "vendored"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6", optional = true, features = ["apple-native"] }
