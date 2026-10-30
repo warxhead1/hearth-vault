@@ -285,7 +285,7 @@ impl VaultStore {
             .map_err(|e| anyhow::anyhow!("failed to wrap data key: {e}"))?;
         pass_key.zeroize();
 
-        let store = Self {
+        let mut store = Self {
             path,
             kdf,
             wrap_passphrase: WrapEntry {
@@ -299,6 +299,8 @@ impl VaultStore {
             loaded_fp: std::cell::Cell::new(None),
         };
         store.save()?;
+        // Creation is done; later mutations take the lock themselves.
+        store.lock = None;
         Ok(store)
     }
 
@@ -1106,10 +1108,12 @@ mod tests {
         let path = dir.path().join("vault.json");
         let mut b = VaultStore::open_at_with_passphrase(path, "stale-test").unwrap();
 
-        a.set("a", &SensitiveString::new("va".into()), 3).unwrap();
+        a.set("a", &SensitiveString::new("va".to_string()), 3)
+            .unwrap();
         a.save().unwrap();
 
-        b.set("b", &SensitiveString::new("vb".into()), 3).unwrap();
+        b.set("b", &SensitiveString::new("vb".to_string()), 3)
+            .unwrap();
         let err = b.save().unwrap_err().to_string();
         assert!(err.contains("changed on disk"), "{err}");
     }
@@ -1120,12 +1124,13 @@ mod tests {
         let path = dir.path().join("vault.json");
         let mut b = VaultStore::open_at_with_passphrase(path.clone(), "refresh-test").unwrap();
 
-        a.set("a", &SensitiveString::new("va".into()), 3).unwrap();
+        a.set("a", &SensitiveString::new("va".to_string()), 3)
+            .unwrap();
         a.save().unwrap();
         drop(a);
 
         b.lock_and_refresh().unwrap();
-        let vb = SensitiveString::new("vb".into());
+        let vb = SensitiveString::new("vb".to_string());
         b.set("b", &vb, 3).unwrap();
         b.save().unwrap();
         b.verify_persisted(&[("b", &vb)]).unwrap();
@@ -1138,7 +1143,7 @@ mod tests {
     #[test]
     fn verify_persisted_reports_a_key_that_is_not_on_disk() {
         let (mut store, _dir) = temp_vault("verify-test");
-        let v = SensitiveString::new("v".into());
+        let v = SensitiveString::new("v".to_string());
         store.set("unsaved", &v, 3).unwrap();
         let err = store.verify_persisted(&[("unsaved", &v)]).unwrap_err();
         assert!(err.to_string().contains("verification failed"));
