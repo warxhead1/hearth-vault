@@ -6,11 +6,11 @@
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
-    aead::{Aead, KeyInit, OsRng, Payload},
+    aead::{Aead, KeyInit, Payload},
 };
 use argon2::{Algorithm, Argon2, Params, Version};
-use hkdf::Hkdf;
-use rand::RngCore;
+use hkdf::SimpleHkdf as Hkdf;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use sha3::Sha3_256;
 use zeroize::Zeroizing;
@@ -105,11 +105,11 @@ pub fn encrypt_aes256gcm(
 ) -> Result<Vec<u8>, CryptoError> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::EncryptionFailed)?;
     let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    fill_os_random(&mut nonce_bytes);
+    let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|_| CryptoError::EncryptionFailed)?;
     let ciphertext = cipher
         .encrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: plaintext,
                 aad,
@@ -141,10 +141,10 @@ pub fn decrypt_aes256gcm(
     }
     let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::DecryptionFailed)?;
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes).map_err(|_| CryptoError::DecryptionFailed)?;
     cipher
         .decrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: ciphertext,
                 aad,
@@ -225,8 +225,16 @@ pub fn hash_blake3(data: &[u8]) -> [u8; 32] {
 /// `N` cryptographically secure random bytes from the OS RNG.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
-    OsRng.fill_bytes(&mut buf);
+    fill_os_random(&mut buf);
     buf
+}
+
+/// Fill `buf` from the OS RNG. An OS RNG failure is unrecoverable for a key
+/// store, so it aborts rather than returning predictable bytes.
+fn fill_os_random(buf: &mut [u8]) {
+    SystemRandom::new()
+        .fill(buf)
+        .expect("OS random number generator unavailable");
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
