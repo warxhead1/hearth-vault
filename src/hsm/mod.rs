@@ -87,6 +87,41 @@ fn tier3_advice() -> &'static str {
     }
 }
 
+/// True when this build can drive the TPM2 backend at all.
+pub const TPM2_COMPILED: bool = cfg!(all(feature = "tpm2", target_os = "linux"));
+
+/// Does `blob` have the shape of a TPM2-sealed blob (`u32le pub_len | pub |
+/// u32le priv_len | priv`, with nothing trailing)?
+///
+/// The sealed-passphrase file carries no backend tag, so shape is the only
+/// "metadata" there is. The other backends cannot collide with it: the
+/// keyring blob is the ASCII label and a systemd-creds blob is text, so their
+/// first four bytes read as a length in the hundreds of millions, which can
+/// never fit in the file.
+pub fn looks_like_tpm2_blob(blob: &[u8]) -> bool {
+    fn take_len(b: &[u8]) -> Option<(usize, &[u8])> {
+        let (head, rest) = b.split_first_chunk::<4>()?;
+        let n = u32::from_le_bytes(*head) as usize;
+        (n > 0 && rest.len() >= n).then(|| (n, &rest[n..]))
+    }
+    let Some((_, rest)) = take_len(blob) else {
+        return false;
+    };
+    matches!(take_len(rest), Some((_, tail)) if tail.is_empty())
+}
+
+/// Error for a vault sealed with the tpm2 backend opened by a build that
+/// cannot talk to a TPM. Without this the user sees the keyring fallback
+/// fail with an OS error and reads it as a boot-chain security event.
+pub fn tpm2_feature_missing_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "this vault is sealed with the tpm2 backend, but this hearth-vault binary was \
+         built without the `tpm2` feature (a build mismatch, not a security event). \
+         Rebuild with: cargo install --path . --locked --features tpm2   \
+         (Linux only; needs tpm2-tools and libtss2-dev)"
+    )
+}
+
 /// Resolve a specific backend by name, for the CLI's `--backend {tpm2,keyring}`
 /// flag. Lets a user in a degraded environment (WSL, container, CI) pin the
 /// backend instead of relying on auto-detection.
@@ -208,6 +243,21 @@ mod tests {
                 assert!(msg.contains("passphrase"), "unhelpful error: {msg}");
             }
         }
+    }
+
+    #[test]
+    fn tpm2_blob_shape_is_recognised_and_others_are_not() {
+        let mut tpm = Vec::new();
+        for part in [&[7u8; 50][..], &[9u8; 120][..]] {
+            tpm.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            tpm.extend_from_slice(part);
+        }
+        assert!(looks_like_tpm2_blob(&tpm));
+        assert!(!looks_like_tpm2_blob(b"hearth-vault"));
+        assert!(!looks_like_tpm2_blob(b"WyJjcmVkZW50aWFsIiwgImJsb2IiXQ=="));
+        assert!(!looks_like_tpm2_blob(&[]));
+        tpm.push(0);
+        assert!(!looks_like_tpm2_blob(&tpm), "trailing bytes");
     }
 
     #[test]

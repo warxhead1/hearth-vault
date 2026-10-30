@@ -9,7 +9,19 @@ all-features = true
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    # zbus_names / zvariant / zvariant_derive: "unmaintained" notices (the
+    # crates were folded into zbus 6), NOT vulnerabilities, with no patched
+    # version. Reached only via keyring 3.6 -> secret-service 4 -> zbus 4,
+    # the Linux Secret Service client. Checked 2026-10-30: keyring 4.2 and
+    # secret-service 5.2 still sit on zbus 5 (same advisories) and raise the
+    # MSRV past 1.88, so nothing reachable clears them. The code path only
+    # talks to the local session D-Bus. Re-check by 2026-12-01 for a
+    # keyring/secret-service release built on zbus 6.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained; no patched version reachable via keyring" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained; no patched version reachable via keyring" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained; no patched version reachable via keyring" },
+]
 
 [licenses]
 allow = [

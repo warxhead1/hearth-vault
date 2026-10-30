@@ -787,6 +787,16 @@ fn open_vault(vault_path: PathBuf, backend_name: Option<&str>) -> anyhow::Result
     let sealed_path = sealed_passphrase_path(&vault_path);
 
     if sealed_path.exists() {
+        // A tpm2-sealed vault opened by a build without the feature is a
+        // build mismatch. Say so and stop, rather than letting another
+        // backend fail with a misleading "boot chain changed?" error.
+        if !hearth_vault::hsm::TPM2_COMPILED {
+            if let Ok(blob) = fs::read(&sealed_path) {
+                if hearth_vault::hsm::looks_like_tpm2_blob(&blob) {
+                    return Err(hearth_vault::hsm::tpm2_feature_missing_error());
+                }
+            }
+        }
         match resolve_backend(backend_name) {
             Ok(hsm) if hsm.tier() <= 2 => match fs::read(&sealed_path) {
                 Ok(blob) => match hsm.unseal(&blob, "hearth-vault") {
