@@ -1181,6 +1181,9 @@ fn cmd_set(
     let interactive = std::io::stdin().is_terminal();
     let mut stored_tiers: Vec<u8> = Vec::with_capacity(keys.len());
 
+    // Collect every value BEFORE taking the vault lock: a human typing at a
+    // prompt must not hold up every other writer.
+    let mut pending: Vec<(String, SensitiveString)> = Vec::with_capacity(keys.len());
     for key in keys {
         let mut value = if interactive {
             rpassword::prompt_password(format!("Value for '{key}': "))?
@@ -1198,7 +1201,22 @@ fn cmd_set(
             value.zeroize();
             continue;
         }
+        pending.push((
+            key.clone(),
+            SensitiveString::new(std::mem::take(&mut value)),
+        ));
+    }
 
+    if pending.is_empty() {
+        eprintln!("Stored 0 credential(s).");
+        return Ok(());
+    }
+
+    // From here to the verified save is one read-modify-write.
+    store.lock_and_refresh()?;
+
+    for (key, sensitive) in &pending {
+        let key = key.as_str();
         // Rotation must not retier. An explicit --tier always wins; with no
         // flag, an existing key keeps the tier it already has and only a new
         // key gets the tier-3 default. Otherwise `set` on a tier-2 key --
@@ -1206,9 +1224,7 @@ fn cmd_set(
         // use-only and break whatever was reading it via export-env.
         let key_tier = tier.or_else(|| store.tier_of(key)).unwrap_or(TIER_USE_ONLY);
 
-        let sensitive = SensitiveString::new(value.clone());
-        value.zeroize();
-        store.set(key, &sensitive, key_tier)?;
+        store.set(key, sensitive, key_tier)?;
 
         // Order matters: `set` recomputes the due date from any EXISTING
         // policy, so a new policy must be applied after it, and an explicit
@@ -1222,13 +1238,22 @@ fn cmd_set(
             store.set_expiry(key, Some(when.clone()))?;
         }
 
-        eprintln!("  \u{2713} {key} (tier {key_tier})");
         stored_tiers.push(key_tier);
     }
 
     store.save()?;
-    eprintln!("Stored {} credential(s).", keys.len());
-    for entry in store.list().iter().filter(|e| keys.contains(&e.key)) {
+    let expected: Vec<(&str, &SensitiveString)> =
+        pending.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    store.verify_persisted(&expected)?;
+    for (i, (key, _)) in pending.iter().enumerate() {
+        eprintln!("  \u{2713} {key} (tier {})", stored_tiers[i]);
+    }
+    eprintln!("Stored {} credential(s).", pending.len());
+    for entry in store
+        .list()
+        .iter()
+        .filter(|e| pending.iter().any(|(k, _)| k == &e.key))
+    {
         if let Some(ref due) = entry.expires_at {
             eprintln!("  {} next due {}", entry.key, friendly_date(due));
         }
@@ -1263,8 +1288,15 @@ fn cmd_import(
 
     let mut store = open_vault(vault_path, backend)?;
     let sensitive = SensitiveString::new(value);
+    store.lock_and_refresh()?;
     store.set(key, &sensitive, tier)?;
     store.save()?;
+    // The source is the only other copy of this value. Prove the vault file
+    // holds it before anything is reported or destroyed; on failure the
+    // source stays and the command exits nonzero.
+    store
+        .verify_persisted(&[(key, &sensitive)])
+        .map_err(|e| anyhow::anyhow!("{e}; source file NOT deleted: {file_path}"))?;
 
     // Securely delete the source file: overwrite with zeros, then remove
     secure_delete_file(&path)?;
@@ -1393,9 +1425,11 @@ fn cmd_import_env(
     }
 
     let mut store = open_vault(vault_path, backend)?;
+    store.lock_and_refresh()?;
 
     let mut stored = 0usize;
     let mut skipped = Vec::new();
+    let mut expected_pairs: Vec<(String, SensitiveString)> = Vec::new();
     for (key, value) in &pairs {
         let full_key = format!("{prefix}{key}");
         if value.is_empty() {
@@ -1408,10 +1442,17 @@ fn cmd_import_env(
             ));
             continue;
         }
-        store.set(&full_key, &SensitiveString::new(value.clone()), tier)?;
+        let sensitive = SensitiveString::new(value.clone());
+        store.set(&full_key, &sensitive, tier)?;
+        expected_pairs.push((full_key, sensitive));
         stored += 1;
     }
     store.save()?;
+    let expected: Vec<(&str, &SensitiveString)> = expected_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v))
+        .collect();
+    store.verify_persisted(&expected)?;
 
     eprintln!("Imported {stored} credential(s) from {file_path} at tier {tier}.");
     if !skipped.is_empty() {
@@ -1605,6 +1646,7 @@ fn cmd_delete(
     no_backup: bool,
 ) -> anyhow::Result<()> {
     let mut store = open_vault(vault_path.clone(), backend)?;
+    store.lock_and_refresh()?;
     if !store.has(key) {
         eprintln!("Key not found: {key}");
         std::process::exit(1);
@@ -1632,6 +1674,7 @@ fn cmd_rename(
     to: &str,
 ) -> anyhow::Result<()> {
     let mut store = open_vault(vault_path, backend)?;
+    store.lock_and_refresh()?;
     store.rename(from, to)?;
     store.save()?;
     eprintln!("  \u{2713} {from} -> {to}");
@@ -1645,6 +1688,7 @@ fn cmd_retier(
     tier: u8,
 ) -> anyhow::Result<()> {
     let mut store = open_vault(vault_path, backend)?;
+    store.lock_and_refresh()?;
     let prev_tier = store
         .tier_of(key)
         .ok_or_else(|| anyhow::anyhow!("key not found: {key}"))?;
@@ -1738,6 +1782,7 @@ fn cmd_recover(vault_path: PathBuf) -> anyhow::Result<()> {
     let mnemonic = rpassword::prompt_password("Recovery words: ")?;
 
     let mut store = VaultStore::open_at_with_mnemonic(vault_path, &mnemonic)?;
+    store.lock_and_refresh()?;
 
     let entries = store.list();
     eprintln!(
@@ -1771,6 +1816,7 @@ fn cmd_new_recovery_key(vault_path: PathBuf) -> anyhow::Result<()> {
 
     let passphrase = rpassword::prompt_password("Vault passphrase: ")?;
     let mut store = VaultStore::open_at_with_passphrase(vault_path, &passphrase)?;
+    store.lock_and_refresh()?;
 
     let had_recovery = store.has_recovery_key();
     let mnemonic = store.generate_recovery_key()?;
@@ -1818,6 +1864,7 @@ fn cmd_change_passphrase(vault_path: PathBuf, backend: Option<&str>) -> anyhow::
     // Rewraps the data key only — entries are never re-encrypted, and the
     // recovery mnemonic (which wraps the same data key independently)
     // keeps working unchanged.
+    store.lock_and_refresh()?;
     store.change_passphrase(&new_pass)?;
     store.save()?;
 
@@ -2952,6 +2999,11 @@ fn adopt_findings(
     }
 
     let mut store = open_vault(vault_path, backend)?;
+    store.lock_and_refresh()?;
+    // Source rewrites are deferred until the vault file is saved and
+    // verified: they remove the only other copy of each value.
+    let mut deferred_writes: Vec<(PathBuf, String)> = Vec::new();
+    let mut stored_pairs: Vec<(String, SensitiveString)> = Vec::new();
 
     let mut by_file: std::collections::BTreeMap<PathBuf, Vec<&hearth_vault::scan::Finding>> =
         std::collections::BTreeMap::new();
@@ -3000,7 +3052,9 @@ fn adopt_findings(
                 continue;
             }
 
-            store.set(&full_key, &SensitiveString::new(value), TIER_USE_ONLY)?;
+            let sensitive = SensitiveString::new(value);
+            store.set(&full_key, &sensitive, TIER_USE_ONLY)?;
+            stored_pairs.push((full_key.clone(), sensitive));
             adopted.push(full_key.clone());
 
             // Write a pointer, NOT the commented-out original. Commenting a
@@ -3015,11 +3069,17 @@ fn adopt_findings(
         if changed {
             let mut new_content = lines.join("\n");
             new_content.push('\n');
-            fs::write(&file_path, new_content)?;
+            deferred_writes.push((file_path, new_content));
         }
     }
 
     store.save()?;
+    let expected: Vec<(&str, &SensitiveString)> =
+        stored_pairs.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    store.verify_persisted(&expected)?;
+    for (file_path, new_content) in deferred_writes {
+        fs::write(&file_path, new_content)?;
+    }
 
     Ok(AdoptOutcome {
         adopted,
@@ -3686,6 +3746,7 @@ fn cmd_restore(vault_path: PathBuf, file: &str) -> anyhow::Result<()> {
     }
 
     let contents = Zeroizing::new(fs::read(&source)?);
+    let _lock = hearth_vault::store::VaultLock::acquire(&vault_path)?;
     platform::write_private(&vault_path, &contents)
         .map_err(|e| anyhow::anyhow!("failed to write restored vault: {e}"))?;
 
@@ -3926,8 +3987,10 @@ fn cmd_receive(
         return Ok(());
     }
 
+    store.lock_and_refresh()?;
     let mut stored = 0usize;
     let mut skipped = Vec::new();
+    let mut stored_pairs: Vec<(String, SensitiveString)> = Vec::new();
     for entry in &entries {
         let key = rename(&entry.key);
         if store.has(&key) && !force {
@@ -3936,11 +3999,15 @@ fn cmd_receive(
         }
         store.set(&key, &entry.value, entry.tier)?;
         eprintln!("  \u{2713} {key} (tier {})", entry.tier);
+        stored_pairs.push((key, SensitiveString::new(entry.value.as_str().to_string())));
         stored += 1;
     }
 
     if stored > 0 {
         store.save()?;
+        let expected: Vec<(&str, &SensitiveString)> =
+            stored_pairs.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        store.verify_persisted(&expected)?;
     }
     eprintln!("Stored {stored} credential(s) from {file}.");
     if !skipped.is_empty() {

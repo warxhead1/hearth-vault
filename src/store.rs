@@ -187,6 +187,13 @@ pub struct VaultStore {
     /// The random 256-bit key that encrypts `body`. Zeroized on drop.
     data_key: [u8; 32],
     body: VaultBody,
+    /// Held from [`VaultStore::lock_and_refresh`] until the store is dropped.
+    lock: Option<VaultLock>,
+    /// Digest of the vault file as this store last read or wrote it. `save`
+    /// refuses to overwrite a file that no longer matches, so a mutation
+    /// that skipped the lock fails loudly instead of silently dropping
+    /// another process's write.
+    loaded_fp: std::cell::Cell<Option<[u8; 32]>>,
 }
 
 impl Drop for VaultStore {
@@ -243,15 +250,32 @@ impl VaultStore {
             let probe: serde_json::Value = serde_json::from_str(&contents)
                 .map_err(|e| anyhow::anyhow!("corrupt vault file: {e}"))?;
             if probe.get("version").is_none() {
-                migrate_v1_to_v2(&path, passphrase)?;
+                // Rewriting the file is a mutation: two processes migrating
+                // at once would each re-key it and the loser's key would be
+                // the one the other no longer opens.
+                let _lock = VaultLock::acquire(&path)?;
+                let again = fs::read_to_string(&path)?;
+                let probe: serde_json::Value = serde_json::from_str(&again)
+                    .map_err(|e| anyhow::anyhow!("corrupt vault file: {e}"))?;
+                if probe.get("version").is_none() {
+                    migrate_v1_to_v2(&path, passphrase)?;
+                }
             }
             Self::load_v2(path, passphrase)
         } else {
-            Self::create_new(path, passphrase)
+            // Creation is a mutation too: two first-ever writers must not
+            // each mint a data key and let the second rename clobber the
+            // first's vault.
+            let lock = VaultLock::acquire(&path)?;
+            if path.exists() {
+                drop(lock);
+                return Self::load_v2(path, passphrase);
+            }
+            Self::create_new(path, passphrase, lock)
         }
     }
 
-    fn create_new(path: PathBuf, passphrase: &str) -> anyhow::Result<Self> {
+    fn create_new(path: PathBuf, passphrase: &str, lock: VaultLock) -> anyhow::Result<Self> {
         let data_key: [u8; 32] = crypto::random_bytes();
         let kdf = KdfParams::default();
         let salt: [u8; 32] = crypto::random_bytes();
@@ -261,7 +285,7 @@ impl VaultStore {
             .map_err(|e| anyhow::anyhow!("failed to wrap data key: {e}"))?;
         pass_key.zeroize();
 
-        let store = Self {
+        let mut store = Self {
             path,
             kdf,
             wrap_passphrase: WrapEntry {
@@ -271,8 +295,12 @@ impl VaultStore {
             wrap_recovery: None,
             data_key,
             body: VaultBody::default(),
+            lock: Some(lock),
+            loaded_fp: std::cell::Cell::new(None),
         };
         store.save()?;
+        // Creation is done; later mutations take the lock themselves.
+        store.lock = None;
         Ok(store)
     }
 
@@ -304,6 +332,8 @@ impl VaultStore {
             wrap_recovery: file.wrap.recovery,
             data_key,
             body,
+            lock: None,
+            loaded_fp: std::cell::Cell::new(Some(fingerprint(contents.as_bytes()))),
         })
     }
 
@@ -347,11 +377,96 @@ impl VaultStore {
             wrap_recovery: file.wrap.recovery,
             data_key,
             body,
+            lock: None,
+            loaded_fp: std::cell::Cell::new(Some(fingerprint(contents.as_bytes()))),
         })
     }
 
+    /// Take the exclusive vault lock and re-read the file, so the mutation
+    /// that follows is applied to what is on disk NOW rather than to what
+    /// this process read before it prompted, derived keys, or waited its
+    /// turn. Call it immediately before the first mutation and keep the
+    /// store alive until [`VaultStore::save`] and any verification are done;
+    /// the lock is released when the store is dropped.
+    ///
+    /// Fails if the file no longer opens with the data key this store holds
+    /// (it was replaced by a different vault).
+    pub fn lock_and_refresh(&mut self) -> anyhow::Result<()> {
+        if self.lock.is_none() {
+            self.lock = Some(VaultLock::acquire(&self.path)?);
+        }
+        let contents = fs::read_to_string(&self.path)
+            .map_err(|e| anyhow::anyhow!("cannot re-read vault file under lock: {e}"))?;
+        let file: VaultFileV2 = serde_json::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("corrupt vault file: {e}"))?;
+        if file.version != 2 {
+            anyhow::bail!("unsupported vault format version {}", file.version);
+        }
+        let body = decrypt_body(&self.data_key, &file.vault)
+            .map_err(|_| anyhow::anyhow!("vault file was replaced since it was opened"))?;
+        for entry in self.body.entries.values_mut() {
+            entry.value.zeroize();
+        }
+        self.body = body;
+        self.kdf = file.kdf;
+        self.wrap_passphrase = file.wrap.passphrase;
+        self.wrap_recovery = file.wrap.recovery;
+        self.loaded_fp.set(Some(fingerprint(contents.as_bytes())));
+        Ok(())
+    }
+
+    /// Re-read the vault file from disk and confirm every `(key, value)`
+    /// pair decrypts back to what was meant to be stored. A caller that is
+    /// about to report success, or destroy the only other copy of a value,
+    /// runs this first.
+    pub fn verify_persisted(&self, expected: &[(&str, &SensitiveString)]) -> anyhow::Result<()> {
+        let contents = fs::read_to_string(&self.path)
+            .map_err(|e| anyhow::anyhow!("verification could not read vault file: {e}"))?;
+        let file: VaultFileV2 = serde_json::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("verification: corrupt vault file: {e}"))?;
+        let mut body = decrypt_body(&self.data_key, &file.vault)
+            .map_err(|_| anyhow::anyhow!("verification: stored vault does not decrypt"))?;
+        let mut missing = Vec::new();
+        for (key, value) in expected {
+            match body.entries.get(*key) {
+                Some(e) if e.value == value.as_str() => {}
+                _ => missing.push((*key).to_string()),
+            }
+        }
+        for entry in body.entries.values_mut() {
+            entry.value.zeroize();
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "verification failed: not stored in the vault file: {}",
+                missing.join(", ")
+            )
+        }
+    }
+
     /// Persist the vault to disk with owner-only permissions.
+    ///
+    /// Serialised against other writers by the vault lock (taken here if the
+    /// caller has not already taken it via [`VaultStore::lock_and_refresh`]),
+    /// and refuses to overwrite a file that changed since this store read it.
     pub fn save(&self) -> anyhow::Result<()> {
+        let _transient = if self.lock.is_none() {
+            Some(VaultLock::acquire(&self.path)?)
+        } else {
+            None
+        };
+        if let Some(expected) = self.loaded_fp.get() {
+            let on_disk = fs::read(&self.path).ok().map(|b| fingerprint(&b));
+            if on_disk != Some(expected) {
+                anyhow::bail!(
+                    "vault file changed on disk since it was opened; nothing was written \
+                     (another process saved first) -- re-run the command"
+                );
+            }
+        }
+
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
             // The directory is part of the containment, not just the file.
@@ -387,6 +502,7 @@ impl VaultStore {
         // file must never exist readable-by-others even for an instant.
         crate::hsm::platform::write_private(&self.path, json.as_bytes())
             .map_err(|e| anyhow::anyhow!("failed to write vault file: {e}"))?;
+        self.loaded_fp.set(Some(fingerprint(json.as_bytes())));
 
         Ok(())
     }
@@ -651,6 +767,8 @@ impl VaultStore {
             wrap_recovery: file.wrap.recovery,
             data_key,
             body,
+            lock: None,
+            loaded_fp: std::cell::Cell::new(Some(fingerprint(contents.as_bytes()))),
         })
     }
 
@@ -679,6 +797,127 @@ impl VaultStore {
             .map(|(k, e)| (k.clone(), SensitiveString::new(e.value.clone()), e.tier))
             .collect()
     }
+}
+
+fn fingerprint(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
+}
+
+/// Exclusive advisory lock on a sidecar `<vault>.lock` file, held for the
+/// whole read-modify-write of the vault. The OS drops it when the process
+/// exits, so a crashed holder never leaves a stale lock; the sidecar file
+/// itself is harmless and is never deleted.
+pub struct VaultLock {
+    _file: fs::File,
+}
+
+/// How long a writer waits for the lock before giving up. Holders only keep
+/// it across an in-memory mutation and one small file write, so reaching
+/// this means something is wedged, not busy.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl VaultLock {
+    /// Path of the sidecar lock file for the vault at `vault_path`.
+    pub fn path_for(vault_path: &Path) -> PathBuf {
+        let name = vault_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "vault.json".to_string());
+        vault_path.with_file_name(format!("{name}.lock"))
+    }
+
+    /// Block (up to [`LOCK_WAIT`]) until this process holds the lock.
+    pub fn acquire(vault_path: &Path) -> anyhow::Result<Self> {
+        let lock_path = Self::path_for(vault_path);
+        if let Some(parent) = lock_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
+            .open(&lock_path)
+            .map_err(|e| anyhow::anyhow!("cannot open vault lock {}: {e}", lock_path.display()))?;
+
+        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        loop {
+            match try_lock_exclusive(&file) {
+                Ok(true) => return Ok(Self { _file: file }),
+                Ok(false) => {
+                    if std::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "timed out waiting for the vault lock {} (another hearth-vault \
+                             process is holding it)",
+                            lock_path.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => {
+                    anyhow::bail!("cannot lock {}: {e}", lock_path.display());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_exclusive(file: &fs::File) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        // SAFETY: plain flock(2) on a descriptor we own for the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => return Ok(false),
+            _ => return Err(err),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_exclusive(file: &fs::File) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, GetLastError};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    // SAFETY: zeroed OVERLAPPED is the documented "offset 0" form, and the
+    // handle is valid for the duration of the call.
+    unsafe {
+        let mut overlapped: OVERLAPPED = std::mem::zeroed();
+        let ok = LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        );
+        if ok != 0 {
+            Ok(true)
+        } else if GetLastError() == ERROR_LOCK_VIOLATION {
+            Ok(false)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn try_lock_exclusive(_file: &fs::File) -> std::io::Result<bool> {
+    Ok(true)
 }
 
 fn decrypt_body(data_key: &[u8; 32], vault_b64: &str) -> anyhow::Result<VaultBody> {
@@ -861,6 +1100,53 @@ mod tests {
         let path = dir.path().join("vault.json");
         let store = VaultStore::open_at_with_passphrase(path, passphrase).unwrap();
         (store, dir)
+    }
+
+    #[test]
+    fn stale_store_refuses_to_overwrite_a_newer_file() {
+        let (mut a, dir) = temp_vault("stale-test");
+        let path = dir.path().join("vault.json");
+        let mut b = VaultStore::open_at_with_passphrase(path, "stale-test").unwrap();
+
+        a.set("a", &SensitiveString::new("va".to_string()), 3)
+            .unwrap();
+        a.save().unwrap();
+
+        b.set("b", &SensitiveString::new("vb".to_string()), 3)
+            .unwrap();
+        let err = b.save().unwrap_err().to_string();
+        assert!(err.contains("changed on disk"), "{err}");
+    }
+
+    #[test]
+    fn lock_and_refresh_keeps_the_other_writers_entry() {
+        let (mut a, dir) = temp_vault("refresh-test");
+        let path = dir.path().join("vault.json");
+        let mut b = VaultStore::open_at_with_passphrase(path.clone(), "refresh-test").unwrap();
+
+        a.set("a", &SensitiveString::new("va".to_string()), 3)
+            .unwrap();
+        a.save().unwrap();
+        drop(a);
+
+        b.lock_and_refresh().unwrap();
+        let vb = SensitiveString::new("vb".to_string());
+        b.set("b", &vb, 3).unwrap();
+        b.save().unwrap();
+        b.verify_persisted(&[("b", &vb)]).unwrap();
+        drop(b);
+
+        let reopened = VaultStore::open_at_with_passphrase(path, "refresh-test").unwrap();
+        assert!(reopened.has("a") && reopened.has("b"));
+    }
+
+    #[test]
+    fn verify_persisted_reports_a_key_that_is_not_on_disk() {
+        let (mut store, _dir) = temp_vault("verify-test");
+        let v = SensitiveString::new("v".to_string());
+        store.set("unsaved", &v, 3).unwrap();
+        let err = store.verify_persisted(&[("unsaved", &v)]).unwrap_err();
+        assert!(err.to_string().contains("verification failed"));
     }
 
     #[test]
