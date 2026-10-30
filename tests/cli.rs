@@ -207,6 +207,39 @@ fn init_machine_is_noninteractive_and_recovery_is_recipient_encrypted() {
         .failure();
 }
 
+/// A vault sealed with the tpm2 backend, opened by a build without the
+/// `tpm2` feature, must fail with the build-mismatch message and never fall
+/// through to another backend's "boot chain changed?" error.
+#[cfg(not(feature = "tpm2"))]
+#[test]
+fn tpm2_sealed_vault_without_tpm2_feature_names_the_rebuild() {
+    let fx = VaultFixture::new();
+    fx.cmd()
+        .args(["set", "myapp/api-key"])
+        .write_stdin("tpm2-mismatch-fixture-value\n")
+        .assert()
+        .success();
+
+    // Synthetic blob with the TPM2 layout: u32le len | public | u32le len | private.
+    let mut blob = Vec::new();
+    for part in [&[1u8; 40][..], &[2u8; 80][..]] {
+        blob.extend_from_slice(&(part.len() as u32).to_le_bytes());
+        blob.extend_from_slice(part);
+    }
+    std::fs::write(fx.home_path().join("vault-passphrase.sealed"), blob).unwrap();
+
+    fx.cmd()
+        .env_remove("HEARTH_VAULT_PASSPHRASE")
+        .arg("list")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--features tpm2"))
+        .stderr(predicate::str::contains(
+            "cargo install --path . --locked --features tpm2",
+        ))
+        .stderr(predicate::str::contains("Auto-unseal failed").not());
+}
+
 // ── set / list / has / delete ───────────────────────────────────────────
 
 #[test]

@@ -337,6 +337,19 @@ media does not protect against full-disk acquisition. Use `init-machine` so
 the random passphrase is never printed and the recovery mnemonic is delivered
 only as a bundle encrypted to a separately held Hearth Vault identity.
 
+### Installing on a TPM-sealed host
+
+A vault sealed with the `tpm2` backend can only be opened by a binary built
+with the `tpm2` feature. Install with:
+
+```sh
+cargo install --path . --locked --features tpm2
+```
+
+(Linux; needs `tpm2-tools` and `libtss2-dev`.) A default build that meets a
+tpm2-sealed vault stops immediately and prints this same command, rather than
+trying other backends. That message is a build mismatch, not a security event.
+
 ### If the OS keyring hangs or gets skipped
 
 A **locked** keyring answers reads instantly but blocks writes while waiting
