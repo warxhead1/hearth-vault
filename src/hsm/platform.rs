@@ -124,6 +124,12 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+
+    // The rename is only durable once the directory entry is synced.
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        d.sync_all()?;
+    }
     Ok(())
 }
 
