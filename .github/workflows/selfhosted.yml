@@ -58,7 +58,7 @@ jobs:
     name: tier 1 on real TPM hardware
     runs-on: [self-hosted, linux, tpm2]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # A self-hosted runner's workspace persists between runs, unlike a
       # hosted one. Stale artifacts are exactly how a "passing" verification
@@ -113,7 +113,7 @@ jobs:
     if: inputs.keyring
     runs-on: [self-hosted, linux, tpm2]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # This leg needs the runner to be running INSIDE the desktop session
       # whose keyring you want tested (DBUS_SESSION_BUS_ADDRESS inherited from
