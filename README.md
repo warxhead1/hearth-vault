@@ -244,12 +244,19 @@ sign --key K --algorithm ALG --message M
                          RSA-PSS-SHA256, RS256, RS512. Prints a base64
                          signature (JWT-style base64url for RS256/RS512).
                          Works for tier 3 and tier 4 keys.
-github-app-token --installation-id ID [--json] [--repository NAME]...
+github-app-token --installation-id ID [--json] [--repository NAME]... [--permission NAME=read|write]... [--exec -- CMD...]
                          Mint a 1-hour GitHub App installation token by
                          signing a JWT internally from a stored private key
                          and exchanging it with GitHub. The private key
                          never leaves the vault process; only the resulting
                          token is printed. Works for tier 3 and tier 4 keys.
+                         Raw mode needs a TTY. With `--exec -- CMD...` the
+                         token is never printed: CMD runs with GH_TOKEN and
+                         GITHUB_TOKEN set (env only, never argv), the token
+                         is scrubbed from its stdout/stderr, its exit code
+                         is propagated, and no TTY is needed (agents and
+                         scripts). `--permission contents=read` (repeatable)
+                         narrows the token below the installation's grant.
 status [--json]         Show backend type, vault path, permissions, agent
                          state, and how many keys are due for rotation.
 backup [--output PATH]  Write an encrypted snapshot. Needs no passphrase —

@@ -36,7 +36,9 @@ hearth-vault exec --prefix myapp/ -- <command...>
 
 # Derived-output-only operations (private key never leaves the vault process)
 hearth-vault sign --key myapp/signing-key --algorithm RS256 --message "<data>"
-hearth-vault github-app-token --installation-id 123456789
+hearth-vault github-app-token --installation-id 123456789   # prints the token: TTY only
+# Agents/scripts: token goes to the child's GH_TOKEN/GITHUB_TOKEN, never printed
+hearth-vault github-app-token --installation-id 123456789 --repository myapp --permission contents=read --exec -- gh api repos/OWNER/myapp
 
 # Metadata, never values
 hearth-vault list
