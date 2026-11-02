@@ -357,6 +357,27 @@ enum Commands {
         /// to narrow the blast radius.
         #[arg(long = "repository")]
         repository: Vec<String>,
+        /// Narrow the minted token's permissions below the installation's
+        /// grant (repeatable), as `<name>=<read|write>`, e.g.
+        /// `--permission contents=read --permission pull_requests=write`.
+        /// Sent as the `permissions` object of the access_tokens request.
+        /// Combines with `--repository`. Anything other than `read` or
+        /// `write` is rejected before any network call.
+        #[arg(long = "permission", value_name = "NAME=LEVEL")]
+        permission: Vec<String>,
+        /// Run the command after `--` with the minted token in `GH_TOKEN`
+        /// and `GITHUB_TOKEN`, instead of printing it. The token is never
+        /// printed, never placed in any argv, and is scrubbed from the
+        /// child's stdout/stderr (as `exec --redact`). Needs no TTY, so
+        /// agents and scripts can use it. The child's exit code is passed
+        /// through. Raw stdout mode (no `--exec`) still requires a TTY.
+        ///
+        /// Example: hearth-vault github-app-token --installation-id 123 --repository myapp --permission contents=read --exec -- gh api repos/OWNER/myapp
+        #[arg(long, conflicts_with = "json")]
+        exec: bool,
+        /// Command and arguments to run with `--exec` (everything after `--`)
+        #[arg(last = true)]
+        command: Vec<String>,
     },
     /// Cryptographically sign a message using a private key stored in the vault.
     /// The private key never leaves the vault process. Outputs base64-encoded
@@ -967,7 +988,19 @@ fn main() -> anyhow::Result<()> {
             installation_id,
             json,
             repository,
-        } => cmd_github_app_token(vault_path, backend, installation_id, json, &repository)?,
+            permission,
+            exec,
+            command,
+        } => cmd_github_app_token(
+            vault_path,
+            backend,
+            installation_id,
+            json,
+            &repository,
+            &permission,
+            exec,
+            &command,
+        )?,
         Commands::Scan {
             path,
             json,
@@ -2284,11 +2317,36 @@ fn cmd_exec(
 /// child killed by a signal is reported the same way a shell reports it
 /// (128 + signal number).
 fn exec_with_redaction(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     injected: &[(String, SensitiveString)],
     warn_unsealed: bool,
     program: &str,
 ) -> anyhow::Result<()> {
+    let code = run_redacted(
+        cmd,
+        injected,
+        warn_unsealed,
+        program,
+        std::io::stdout(),
+        std::io::stderr(),
+    )?;
+    std::process::exit(code);
+}
+
+/// Body of [`exec_with_redaction`] with injectable output sinks; returns the
+/// exit code instead of exiting so it is unit-testable.
+fn run_redacted<O, E>(
+    mut cmd: std::process::Command,
+    injected: &[(String, SensitiveString)],
+    warn_unsealed: bool,
+    program: &str,
+    out: O,
+    err: E,
+) -> anyhow::Result<i32>
+where
+    O: std::io::Write + Send + 'static,
+    E: std::io::Write + Send + 'static,
+{
     use std::process::Stdio;
 
     let redactor = Redactor::new(
@@ -2322,11 +2380,9 @@ fn exec_with_redaction(
     // blocked writing to stderr (or vice versa) can never deadlock this
     // process — both streams are always being drained concurrently.
     let out_redactor = redactor.clone();
-    let out_thread =
-        std::thread::spawn(move || pump_redacted(child_stdout, std::io::stdout(), out_redactor));
+    let out_thread = std::thread::spawn(move || pump_redacted(child_stdout, out, out_redactor));
     let err_redactor = redactor.clone();
-    let err_thread =
-        std::thread::spawn(move || pump_redacted(child_stderr, std::io::stderr(), err_redactor));
+    let err_thread = std::thread::spawn(move || pump_redacted(child_stderr, err, err_redactor));
 
     // Drain both threads before waiting on the child: the child's pipes
     // must hit EOF (which only happens once the process has exited or
@@ -2347,10 +2403,10 @@ fn exec_with_redaction(
     {
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
-            std::process::exit(128 + signal);
+            return Ok(128 + signal);
         }
     }
-    std::process::exit(status.code().unwrap_or(1));
+    Ok(status.code().unwrap_or(1))
 }
 
 /// Copies `src` to `dst` in bounded-size chunks, redacting each chunk
@@ -2447,35 +2503,114 @@ fn cmd_sign(
 /// Names are simple repo names (`myapp`), not `owner/repo` slugs — GitHub
 /// scopes by name within the installation's owner.
 #[cfg(feature = "github-app-token")]
-fn build_token_request_body(repos: &[String]) -> anyhow::Result<Option<serde_json::Value>> {
-    if repos.is_empty() {
-        return Ok(None);
-    }
-    for r in repos {
-        if r.trim().is_empty() {
-            anyhow::bail!(
-                "--repository value must not be empty; pass a simple repo name like `myapp`"
-            );
+fn build_token_request_body(
+    repos: &[String],
+    permissions: &[String],
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let mut body = serde_json::Map::new();
+    if !repos.is_empty() {
+        for r in repos {
+            if r.trim().is_empty() {
+                anyhow::bail!(
+                    "--repository value must not be empty; pass a simple repo name like `myapp`"
+                );
+            }
         }
+        body.insert("repositories".into(), serde_json::json!(repos));
     }
-    Ok(Some(serde_json::json!({ "repositories": repos })))
+    if !permissions.is_empty() {
+        let mut perms = serde_json::Map::new();
+        for p in permissions {
+            let (name, level) = p.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("--permission must be <name>=<read|write>, got `{p}`")
+            })?;
+            let name = name.trim();
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            {
+                anyhow::bail!(
+                    "--permission name `{name}` is invalid; use a GitHub permission name like `contents` or `pull_requests`"
+                );
+            }
+            let level = level.trim();
+            if level != "read" && level != "write" {
+                anyhow::bail!(
+                    "--permission level for `{name}` must be `read` or `write`, got `{level}`"
+                );
+            }
+            if perms
+                .insert(name.to_string(), serde_json::json!(level))
+                .is_some()
+            {
+                anyhow::bail!("--permission `{name}` given more than once");
+            }
+        }
+        body.insert("permissions".into(), serde_json::Value::Object(perms));
+    }
+    if body.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::Value::Object(body)))
+    }
+}
+
+/// Env var names the `--exec` child receives the minted token under.
+#[cfg(feature = "github-app-token")]
+const GITHUB_TOKEN_ENV_NAMES: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
+
+/// Run `command` with the installation `token` in its environment only
+/// (never argv), scrubbing the token from the child's stdout/stderr, and
+/// exit with the child's code. Never returns on success.
+#[cfg(feature = "github-app-token")]
+fn exec_with_installation_token(command: &[String], token: &str) -> anyhow::Result<()> {
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("--exec needs a command after `--`"))?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    let mut injected = Vec::new();
+    for name in GITHUB_TOKEN_ENV_NAMES {
+        cmd.env(name, token);
+        injected.push((name.to_string(), SensitiveString::new(token.to_string())));
+    }
+    note!(
+        "github-app-token --exec: token injected into `{program}` as GH_TOKEN/GITHUB_TOKEN (never printed; scrubbed from its output)."
+    );
+    exec_with_redaction(cmd, &injected, false, program)
 }
 
 #[cfg(feature = "github-app-token")]
+#[allow(clippy::too_many_arguments)]
 fn cmd_github_app_token(
     vault_path: PathBuf,
     backend: Option<&str>,
     installation_id: Option<i64>,
     output_json: bool,
     repositories: &[String],
+    permissions: &[String],
+    exec: bool,
+    command: &[String],
 ) -> anyhow::Result<()> {
     use base64::Engine;
 
-    refuse_if_non_tty("github-app-token")?;
+    if exec {
+        if command.is_empty() {
+            anyhow::bail!("--exec needs a command after `--`");
+        }
+    } else {
+        if !command.is_empty() {
+            anyhow::bail!("a command after `--` needs --exec");
+        }
+        // Raw stdout mode prints the token: keep the TTY guard. `--exec`
+        // never prints it, so it is exempt (like `exec`).
+        refuse_if_non_tty("github-app-token")?;
+    }
 
-    // Validate repository scoping up front so we never even open the vault
-    // (or sign a JWT) on a malformed invocation.
-    let scoping_body = build_token_request_body(repositories)?;
+    // Validate repository/permission scoping up front so we never even open
+    // the vault (or sign a JWT) on a malformed invocation.
+    let scoping_body = build_token_request_body(repositories, permissions)?;
 
     let store = open_vault(vault_path, backend)?;
 
@@ -2556,10 +2691,11 @@ fn cmd_github_app_token(
         // installation. Surface a clearer message; do NOT fall back to an
         // unscoped token — that would silently broaden access past what the
         // caller asked for, which is the exact security gap this flag closes.
-        if status.as_u16() == 422 && !repositories.is_empty() {
+        if status.as_u16() == 422 && (!repositories.is_empty() || !permissions.is_empty()) {
             anyhow::bail!(
-                "GitHub installation-token exchange failed: HTTP 422 — one of repositories {:?} is not granted to installation {} (response body suppressed to avoid echoing JWT fragments)",
+                "GitHub installation-token exchange failed: HTTP 422 — one of repositories {:?} / permissions {:?} is not granted to installation {} (response body suppressed to avoid echoing JWT fragments)",
                 repositories,
+                permissions,
                 installation_id,
             );
         }
@@ -2574,6 +2710,10 @@ fn cmd_github_app_token(
         expires_at: String,
     }
     let parsed: InstallationTokenResp = resp.json()?;
+
+    if exec {
+        return exec_with_installation_token(command, &parsed.token);
+    }
 
     if output_json {
         // Use serde to escape the token correctly even if GitHub adds
@@ -4307,7 +4447,7 @@ mod tests {
     #[cfg(feature = "github-app-token")]
     #[test]
     fn build_token_request_body_zero_repos_is_none() {
-        let body = build_token_request_body(&[]).unwrap();
+        let body = build_token_request_body(&[], &[]).unwrap();
         assert!(
             body.is_none(),
             "zero repositories must produce no JSON body so callers without the flag keep working unchanged"
@@ -4319,7 +4459,7 @@ mod tests {
     #[cfg(feature = "github-app-token")]
     #[test]
     fn build_token_request_body_single_repo() {
-        let body = build_token_request_body(&["myapp".to_string()])
+        let body = build_token_request_body(&["myapp".to_string()], &[])
             .unwrap()
             .expect("single repo should produce a JSON body");
         assert_eq!(body, serde_json::json!({"repositories": ["myapp"]}));
@@ -4329,7 +4469,7 @@ mod tests {
     #[cfg(feature = "github-app-token")]
     #[test]
     fn build_token_request_body_multiple_repos() {
-        let body = build_token_request_body(&["myapp".to_string(), "myapp-infra".to_string()])
+        let body = build_token_request_body(&["myapp".to_string(), "myapp-infra".to_string()], &[])
             .unwrap()
             .expect("multi-repo should produce a JSON body");
         assert_eq!(
@@ -4344,7 +4484,7 @@ mod tests {
     #[cfg(feature = "github-app-token")]
     #[test]
     fn build_token_request_body_rejects_empty_string() {
-        let err = build_token_request_body(&["".to_string()]).unwrap_err();
+        let err = build_token_request_body(&["".to_string()], &[]).unwrap_err();
         assert!(
             err.to_string().contains("must not be empty"),
             "expected explicit empty-string rejection, got: {err}"
@@ -4357,7 +4497,7 @@ mod tests {
     #[cfg(feature = "github-app-token")]
     #[test]
     fn build_token_request_body_rejects_whitespace_only() {
-        assert!(build_token_request_body(&["   ".to_string()]).is_err());
+        assert!(build_token_request_body(&["   ".to_string()], &[]).is_err());
     }
 
     /// Mixed-validity input rejects rather than silently dropping the bad
@@ -4365,13 +4505,130 @@ mod tests {
     #[cfg(feature = "github-app-token")]
     #[test]
     fn build_token_request_body_rejects_when_any_entry_is_empty() {
-        let err = build_token_request_body(&[
-            "myapp".to_string(),
-            "".to_string(),
-            "myapp-infra".to_string(),
-        ])
+        let err = build_token_request_body(
+            &[
+                "myapp".to_string(),
+                "".to_string(),
+                "myapp-infra".to_string(),
+            ],
+            &[],
+        )
         .unwrap_err();
         assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[cfg(feature = "github-app-token")]
+    fn perms(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Permissions land in the request body's `permissions` object next to
+    /// `repositories`.
+    #[cfg(feature = "github-app-token")]
+    #[test]
+    fn build_token_request_body_includes_permissions() {
+        let body = build_token_request_body(
+            &["myapp".to_string()],
+            &perms(&["contents=read", "pull_requests=write"]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "repositories": ["myapp"],
+                "permissions": {"contents": "read", "pull_requests": "write"}
+            })
+        );
+        let only = build_token_request_body(&[], &perms(&["contents=read"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            only,
+            serde_json::json!({"permissions": {"contents": "read"}})
+        );
+    }
+
+    /// Bad levels / shapes / duplicates fail in the pure builder, i.e. before
+    /// any vault open or network call.
+    #[cfg(feature = "github-app-token")]
+    #[test]
+    fn build_token_request_body_rejects_bad_permissions() {
+        for bad in [
+            "contents=admin",
+            "contents=",
+            "contents",
+            "=read",
+            "Contents=read",
+            "contents=READ",
+        ] {
+            assert!(
+                build_token_request_body(&[], &perms(&[bad])).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        assert!(
+            build_token_request_body(&[], &perms(&["contents=read", "contents=write"])).is_err()
+        );
+    }
+
+    #[cfg(all(unix, feature = "github-app-token"))]
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    #[cfg(all(unix, feature = "github-app-token"))]
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The child sees the token in GH_TOKEN/GITHUB_TOKEN (not argv), its
+    /// output is scrubbed of the token, and its exit code is returned.
+    #[cfg(all(unix, feature = "github-app-token"))]
+    #[test]
+    fn installation_token_exec_scrubs_output_and_propagates_exit() {
+        let token = "ghs_fixtureTokenValue1234567890abcdef"; // hearth-vault:allow (test fixture, not a credential)
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            r#"echo "out:$GH_TOKEN"; echo "err:$GITHUB_TOKEN" >&2; [ "$GH_TOKEN" = "$GITHUB_TOKEN" ] && exit 7"#, // hearth-vault:allow (shell var reference, not a credential)
+        ]);
+        let mut injected = Vec::new();
+        for n in GITHUB_TOKEN_ENV_NAMES {
+            cmd.env(n, token);
+            injected.push((n.to_string(), SensitiveString::new(token.to_string())));
+        }
+        let (out, err) = (SharedBuf::default(), SharedBuf::default());
+        let code = run_redacted(cmd, &injected, false, "sh", out.clone(), err.clone()).unwrap();
+        assert_eq!(code, 7);
+        let o = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let e = String::from_utf8(err.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !o.contains(token) && !e.contains(token),
+            "token leaked: {o} {e}"
+        );
+        assert!(
+            o.starts_with("out:<vault:") && e.starts_with("err:<vault:"),
+            "{o} {e}"
+        );
+    }
+
+    /// `--exec` mode without a command is rejected up front, and a command
+    /// without `--exec` too (no vault is opened in either case).
+    #[cfg(feature = "github-app-token")]
+    #[test]
+    fn github_app_token_exec_arg_validation() {
+        let nope = PathBuf::from("/nonexistent-vault-for-test");
+        let e = cmd_github_app_token(nope.clone(), None, Some(1), false, &[], &[], true, &[])
+            .unwrap_err();
+        assert!(e.to_string().contains("needs a command"), "{e}");
+        let e = cmd_github_app_token(nope, None, Some(1), false, &[], &[], false, &perms(&["x"]))
+            .unwrap_err();
+        assert!(e.to_string().contains("needs --exec"), "{e}");
     }
 
     // ---- non-TTY refusal ----

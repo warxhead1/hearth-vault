@@ -1526,3 +1526,54 @@ fn seal_check_reports_seal_status_even_when_the_vault_cannot_be_opened() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+// ── github-app-token: raw mode keeps the TTY guard, --exec does not ────
+
+/// Raw-stdout mode (token printed) is still refused without a TTY.
+#[test]
+fn github_app_token_raw_mode_refuses_non_tty() {
+    let fx = VaultFixture::new();
+    fx.cmd()
+        .args(["github-app-token", "--installation-id", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "refuses to run with stdout or stderr redirected",
+        ));
+}
+
+/// `--exec` is not subject to the TTY refusal: it gets past the guard and
+/// fails later (no App credentials in the throwaway vault), never with the
+/// non-TTY message. Bad `--permission` levels fail before the vault opens.
+#[test]
+fn github_app_token_exec_skips_tty_guard_and_validates_permissions() {
+    let fx = VaultFixture::new();
+    fx.cmd()
+        .args([
+            "github-app-token",
+            "--installation-id",
+            "1",
+            "--exec",
+            "--",
+            "true",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("refuses to run").not())
+        .stderr(predicate::str::contains("GITHUB_APP_APP_ID"));
+
+    fx.cmd()
+        .args([
+            "github-app-token",
+            "--installation-id",
+            "1",
+            "--permission",
+            "contents=admin",
+            "--exec",
+            "--",
+            "true",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("must be `read` or `write`"));
+}
