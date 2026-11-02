@@ -4595,7 +4595,7 @@ mod tests {
         let mut cmd = std::process::Command::new("sh");
         cmd.args([
             "-c",
-            r#"echo "out:$GH_TOKEN"; echo "err:$GITHUB_TOKEN" >&2; [ "$GH_TOKEN" = "$GITHUB_TOKEN" ] && exit 7"#,
+            r#"echo "out:$GH_TOKEN"; echo "err:$GITHUB_TOKEN" >&2; [ "$GH_TOKEN" = "$GITHUB_TOKEN" ] && exit 7"#, // hearth-vault:allow (shell var reference, not a credential)
         ]);
         let mut injected = Vec::new();
         for n in GITHUB_TOKEN_ENV_NAMES {
